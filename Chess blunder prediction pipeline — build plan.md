@@ -20,7 +20,24 @@ Three sources, all free, none requiring authentication. The assignment asks for 
 
 The TV feed covers the bullet, blitz, rapid and classical channels. One connection per channel gives six to eight simultaneous games. Each channel sends a `featured` event when a game starts, carrying both players' usernames and ratings, then a stream of `fen` events with the position, last move and both clocks.
 
+What the feed actually sends (checked against a 30 second capture on Oct 28, sample in `data/samples/`):
+
+- `featured`: `{"t":"featured","d":{"id","orientation","players":[{"color","user":{"name","id"},"rating","seconds"}],"fen"}}`
+- `fen`: `{"t":"fen","d":{"fen","lm","wc","bc"}}`. `lm` is the last move in UCI notation, `wc` and `bc` are the remaining clocks in whole seconds.
+
+Three consequences:
+
+- **Move events carry no game id.** The producer must remember the current game per channel and stamp it on every message.
+- **There is no time control or increment in the feed.**
+- **The feed joins games midway** (the capture started at move 23), so the earlier moves are missing. Without them we cannot compute `plies_out_of_book` or the time spent on the previous move.
+
+Fix for the last two: on each `featured` event, the producer calls `GET lichess.org/api/game/{id}` once. That returns the clock settings and the moves played so far. One call per game, not per move, so it stays out of the hot path.
+
 The monthly archive is the training corpus. Roughly 6% of games carry `[%eval ...]` and `[%clk ...]` annotations per move. We need around 60,000 annotated games, which means reading about one million — roughly 1% of a single monthly file.
+
+A monthly file is about 29 GB, but over the whole project we replay roughly 220k annotated games (about 4% of a month). We therefore download only the first 3 GB with an HTTP range request (`curl.exe -r 0-3221225471`). A zstd stream can be decoded from the start of a cut-off file, so the parser simply stops at the last complete game.
+
+Measured on Oct 28: 10.7% of the first 50,000 games in the September 2026 file carry `[%eval`, higher than the 6% we assumed. Scanning cost per replayed batch is correspondingly lower.
 
 The archive does not go straight to storage. An **archive replay producer** reads annotated games from the `.pgn.zst` file and publishes them to the `games.archive` topic in batches, so all game data is ingested through Redpanda. The producer stores its position (byte offset and game count) in a checkpoint table in Postgres and resumes from there on the next run, so every run sends the next new games, never the same ones again. Because the training set grows with every run, periodic retraining actually sees new data.
 
