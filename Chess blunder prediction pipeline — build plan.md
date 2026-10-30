@@ -247,6 +247,15 @@ First look at the signal: blunder rate is 8.6% with under 10 seconds on the cloc
 - Normalise each FEN key to its first three fields, deduplicate, and write `gold/openings/` (FEN key, ECO code, name) as Parquet.
 - Sanity check: the starting position after `1. e4` and after `1. d4 d5 2. c4` both resolve to a named opening.
 
+**Status (Oct 30): local version done** (done early because phase 2 needs it). `ingest/load_openings.py` downloads the six files from pinned commit `e397a1fa` to `data/raw/eco/e397a1fa/` and writes `data/parquet/openings/openings.parquet`; `features/openings.py` loads it as a lookup. The Airflow task and the RustFS upload come with phase 4. Details:
+
+- 15,838 raw entries become 15,373 unique positions (12,105 named, 3,268 interpolated) after shortening the FEN keys.
+- Every entry's move sequence is replayed with python-chess and checked against its key. All 15,838 pass, once move numbers written without a space (`1.e4`) are handled.
+- When several entries share a position (transpositions), we keep the named entry over the interpolated one, then the shortest move sequence.
+- We include `eco_interpolated.json`, and an `is_interpolated` column lets phase 2 compare with and without it.
+
+Coverage on the 3.87M parsed moves: 9.0% of moves are in book (8.7% without interpolated). Games leave the book at ply 7 (median), and 90% have left by ply 11. Blunder rate is **0.53% in book versus 7.54% out of book**, so the opening features carry real signal.
+
 ### Phase 8 — Streamlit dashboard (B)
 
 - Live board with blunder probability per move, current opening name, in-book or out-of-book indicator; channel selector (default rapid).
@@ -304,7 +313,8 @@ Each of these is a deliberate choice with a reason. Writing the reason down now 
 Open questions to settle between us:
 
 - [ ] Confirm the replay defaults: 20k backfill, 5k per run, every 6 hours, 60k training window
-- [ ] Do we include `eco_interpolated.json` (gap-filling positions) or only the named openings in `ecoA` … `ecoE`?
+- [x] Do we include `eco_interpolated.json` (gap-filling positions) or only the named openings in `ecoA` … `ecoE`? Yes, flagged with `is_interpolated` so phase 2 can compare
+- [x] Which month of the archive? September 2026, first 3 GB (SHA-256 in the README)
 - [ ] Which month of the archive do we use, and do we both work from the same slice?
 - [ ] Blunder threshold — what win-probability drop counts?
 - [ ] Do we exclude bot games and unrated players?

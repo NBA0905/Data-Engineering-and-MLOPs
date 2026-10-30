@@ -117,3 +117,11 @@ uv run python -m ingest.parse_archive data\raw\lichess_db_standard_rated_2026-09
 ```
 
 Writes one row per move to `data\parquet\moves\` (about 3.9M rows, 210 MB, roughly 3 minutes). Use `--games 2000 --out data\parquet\trial` for a quick test run.
+
+## Opening book (eco.json)
+
+```powershell
+uv run python -m ingest.load_openings
+```
+
+Downloads the eco.json files from a pinned commit into `data\raw\eco\` and writes the lookup table `data\parquet\openings\openings.parquet` (15,373 positions). Takes a few seconds. Run it before `uv run pytest`, otherwise the opening tests are skipped.
