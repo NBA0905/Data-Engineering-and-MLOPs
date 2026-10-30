@@ -214,6 +214,15 @@ First look at the signal: blunder rate is 8.6% with under 10 seconds on the cloc
 - Train `HistGradientBoostingClassifier` with class weights. Compare to the base rate and the clock-only baseline. Report PR-AUC and calibration.
 - Done when: the model clearly beats the clock-only baseline.
 
+**Status (Oct 30): feature module written**, notebook not started. Interface agreed:
+
+- `features/board.py`: `board_features(board)`. Material balance (mover's view), piece count, in check, legal move count, move number. Needs python-chess, so the batch lane computes these in the parser, not in Spark.
+- `features/openings.py`: `book_features(fen_key, book)` gives `in_book` and the position's ECO letter.
+- `features/game.py`: `GameState`, the per-game state for the sequential features (`plies_out_of_book`, `eco_family` of the last book position, `prev_time_spent` per colour). The live consumer keeps one per game id; Spark computes the same values with window functions.
+- `features/__init__.py`: `compute_features(board, clocks, meta, state, book)`, the ordered `FEATURES` list (the training/serving contract), `BLUNDER_THRESHOLD = 0.15` and `is_scored()` (drops bot and UltraBullet games).
+- Conventions: plies count positions (start = 0, python-chess `board.ply()`); the starting position counts as book; missing values stay `None` (HistGradientBoosting handles NaN natively); `time_spent` uses one shared formula `clock_before - clock_after + inc`.
+- Only information available before the move is used: no evals, no clock after the move.
+
 ### Phase 3 — Redpanda and the TV producer (B, in parallel with 1–2)
 
 - Redpanda (dev-container mode) and Redpanda Console in Docker Compose.
@@ -316,6 +325,6 @@ Open questions to settle between us:
 - [x] Do we include `eco_interpolated.json` (gap-filling positions) or only the named openings in `ecoA` … `ecoE`? Yes, flagged with `is_interpolated` so phase 2 can compare
 - [x] Which month of the archive? September 2026, first 3 GB (SHA-256 in the README)
 - [ ] Which month of the archive do we use, and do we both work from the same slice?
-- [ ] Blunder threshold — what win-probability drop counts?
-- [ ] Do we exclude bot games and unrated players?
+- [x] Blunder threshold — what win-probability drop counts? 0.15 (`BLUNDER_THRESHOLD` in `features/`)
+- [x] Do we exclude bot games and unrated players? Bots out (194 of 59,894 games, blunder rate 4.3% vs 6.9%), in training and live. Unrated is moot for training: the archive file holds rated games only. Live, casual games are scored. UltraBullet is excluded too (171 games, no TV channel)
 - [ ] Which channel does the dashboard default to? Rapid or classical will look more responsive than bullet, given Streamlit's polling refresh.
