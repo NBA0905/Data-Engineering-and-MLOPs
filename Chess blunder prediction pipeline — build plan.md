@@ -193,6 +193,21 @@ Phases 1, 3 and 7 can start at the same time once setup is done. Phase 7 is smal
 - Clamp mate scores, convert eval to win probability, compute the drop.
 - Done when: about 60k games are in Parquet and the blunder rate looks plausible (a few percent).
 
+**Status (Oct 30): done.** `ingest/archive.py` (reader and parser, reused by the replay producer in phase 4) and `ingest/parse_archive.py` (CLI). Result: 60,000 annotated games out of 607,614 scanned, 3.87M move rows, 210 MB Parquet in `data/parquet/moves/`, 173 seconds on 8 workers. The first move of each game is skipped because Lichess does not annotate the starting position. Each row also carries `speed` (computed from the time control with Lichess's rule, so the live lane can compute it the same way) and `lichess_nag`, the `?!` / `?` / `??` mark Lichess's own analysis put on the move.
+
+Choosing the blunder threshold, measured against Lichess's own `??` marks on the trial run (2,000 games):
+
+| Win-probability drop | Moves labelled blunder | Lichess `??` moves caught | Labelled moves that are `??` |
+| --- | --- | --- | --- |
+| 0.10 | 10.9% | 90% | 44% |
+| 0.15 | 7.1% | 84% | 64% |
+| 0.20 | 5.0% | 77% | 83% |
+| 0.30 | 2.8% | 52% | 100% |
+
+Proposal: 0.15, which gives 6.9% blunders over the full 60k games. Lichess's `??` marks are not a pure threshold (some have drops below 0.05, likely mate-related), so we use our own reproducible label and keep `lichess_nag` for validation only.
+
+First look at the signal: blunder rate is 8.6% with under 10 seconds on the clock versus 6.7% above 3 minutes, and 7.5% in bullet versus 6.6% in blitz. Clock alone is a weak predictor, so the clock-only baseline will be easy to beat, and the board features have to carry most of the model.
+
 ### Phase 2 — Notebook model (A). Go / no-go check
 
 - Write `features/` with one function, e.g. `compute_features(board, clocks, meta, book) -> dict`, plus `fen_key(fen) -> str`. This is the interface both lanes import.

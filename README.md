@@ -100,4 +100,20 @@ file size: 3,221,225,472 bytes (complete)
 games read: 50,000, with evals: 5,331 (10.7%)
 ```
 
+To confirm you have exactly the same bytes as the rest of the team, compare the checksum:
+
+```powershell
+(Get-FileHash data\raw\lichess_db_standard_rated_2026-09.part.pgn.zst -Algorithm SHA256).Hash
+```
+
+Expected: `5EE7E70DCDF82996C98CC1EDF733EFCD5152951AB49E2BEC2DCDEBA9FAB0E5F5`
+
 The file is cut off mid-stream, so its very last game is incomplete. That is expected: the parser reads from the start and stops at the last complete game, and we will never get close to the end anyway.
+
+### 5. Parse to Parquet (phase 1)
+
+```powershell
+uv run python -m ingest.parse_archive data\raw\lichess_db_standard_rated_2026-09.part.pgn.zst --games 60000
+```
+
+Writes one row per move to `data\parquet\moves\` (about 3.9M rows, 210 MB, roughly 3 minutes). Use `--games 2000 --out data\parquet\trial` for a quick test run.
