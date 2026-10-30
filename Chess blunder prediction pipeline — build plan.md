@@ -193,6 +193,21 @@ Phases 1, 3 and 7 can start at the same time once setup is done. Phase 7 is smal
 - Clamp mate scores, convert eval to win probability, compute the drop.
 - Done when: about 60k games are in Parquet and the blunder rate looks plausible (a few percent).
 
+**Status (Oct 30): done.** `ingest/archive.py` (reader and parser, reused by the replay producer in phase 4) and `ingest/parse_archive.py` (CLI). Result: 60,000 annotated games out of 607,614 scanned, 3.87M move rows, 210 MB Parquet in `data/parquet/moves/`, 173 seconds on 8 workers. The first move of each game is skipped because Lichess does not annotate the starting position. Each row also carries `speed` (computed from the time control with Lichess's rule, so the live lane can compute it the same way) and `lichess_nag`, the `?!` / `?` / `??` mark Lichess's own analysis put on the move.
+
+Choosing the blunder threshold, measured against Lichess's own `??` marks on the trial run (2,000 games):
+
+| Win-probability drop | Moves labelled blunder | Lichess `??` moves caught | Labelled moves that are `??` |
+| --- | --- | --- | --- |
+| 0.10 | 10.9% | 90% | 44% |
+| 0.15 | 7.1% | 84% | 64% |
+| 0.20 | 5.0% | 77% | 83% |
+| 0.30 | 2.8% | 52% | 100% |
+
+Proposal: 0.15, which gives 6.9% blunders over the full 60k games. Lichess's `??` marks are not a pure threshold (some have drops below 0.05, likely mate-related), so we use our own reproducible label and keep `lichess_nag` for validation only.
+
+First look at the signal: blunder rate is 8.6% with under 10 seconds on the clock versus 6.7% above 3 minutes, and 7.5% in bullet versus 6.6% in blitz. Clock alone is a weak predictor, so the clock-only baseline will be easy to beat, and the board features have to carry most of the model.
+
 ### Phase 2 — Notebook model (A). Go / no-go check
 
 - Write `features/` with one function, e.g. `compute_features(board, clocks, meta, book) -> dict`, plus `fen_key(fen) -> str`. This is the interface both lanes import.
@@ -231,6 +246,15 @@ Phases 1, 3 and 7 can start at the same time once setup is done. Phase 7 is smal
 - Airflow task `load_openings`: download `ecoA.json` … `ecoE.json` from a pinned commit into `bronze/eco/`.
 - Normalise each FEN key to its first three fields, deduplicate, and write `gold/openings/` (FEN key, ECO code, name) as Parquet.
 - Sanity check: the starting position after `1. e4` and after `1. d4 d5 2. c4` both resolve to a named opening.
+
+**Status (Oct 30): local version done** (done early because phase 2 needs it). `ingest/load_openings.py` downloads the six files from pinned commit `e397a1fa` to `data/raw/eco/e397a1fa/` and writes `data/parquet/openings/openings.parquet`; `features/openings.py` loads it as a lookup. The Airflow task and the RustFS upload come with phase 4. Details:
+
+- 15,838 raw entries become 15,373 unique positions (12,105 named, 3,268 interpolated) after shortening the FEN keys.
+- Every entry's move sequence is replayed with python-chess and checked against its key. All 15,838 pass, once move numbers written without a space (`1.e4`) are handled.
+- When several entries share a position (transpositions), we keep the named entry over the interpolated one, then the shortest move sequence.
+- We include `eco_interpolated.json`, and an `is_interpolated` column lets phase 2 compare with and without it.
+
+Coverage on the 3.87M parsed moves: 9.0% of moves are in book (8.7% without interpolated). Games leave the book at ply 7 (median), and 90% have left by ply 11. Blunder rate is **0.53% in book versus 7.54% out of book**, so the opening features carry real signal.
 
 ### Phase 8 — Streamlit dashboard (B)
 
@@ -289,7 +313,8 @@ Each of these is a deliberate choice with a reason. Writing the reason down now 
 Open questions to settle between us:
 
 - [ ] Confirm the replay defaults: 20k backfill, 5k per run, every 6 hours, 60k training window
-- [ ] Do we include `eco_interpolated.json` (gap-filling positions) or only the named openings in `ecoA` … `ecoE`?
+- [x] Do we include `eco_interpolated.json` (gap-filling positions) or only the named openings in `ecoA` … `ecoE`? Yes, flagged with `is_interpolated` so phase 2 can compare
+- [x] Which month of the archive? September 2026, first 3 GB (SHA-256 in the README)
 - [ ] Which month of the archive do we use, and do we both work from the same slice?
 - [ ] Blunder threshold — what win-probability drop counts?
 - [ ] Do we exclude bot games and unrated players?
