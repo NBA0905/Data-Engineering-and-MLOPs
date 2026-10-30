@@ -13,6 +13,7 @@ import requests
 from confluent_kafka import Producer
 
 FEED_URL = "https://lichess.org/api/tv/{channel}/feed"
+GAME_URL = "https://lichess.org/game/export/{game_id}"
 TOPIC = "tv.moves"
 BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "localhost:19092")
 
@@ -35,20 +36,51 @@ def read_feed(channel):
             print(f"[{channel}] connection lost ({error}), reconnecting in 5 s")
             time.sleep(5)
 
+def fetch_game_info(game_id):
+    """asks lichess once per game for the time control and the moves played so far."""
+    url = GAME_URL.format(game_id=game_id)
+    try:
+        response = requests.get(url, headers={"Accept": "application/json"}, timeout=10)
+        response.raise_for_status()
+        info = response.json()
+    except requests.exceptions.RequestException as error:
+        # not the end of the world, the game just gets sent without a time control
+        print(f"could not fetch game {game_id} ({error})")
+        return {"tc_base": None, "tc_inc": None, "moves": ""}
+
+    clock = info.get("clock", {})
+    return {
+        "tc_base": clock.get("initial"),  # starting time in seconds
+        "tc_inc": clock.get("increment"),  # seconds added per move
+        "moves": info.get("moves", ""),  # moves so far, like "e4 e5 Nf3"
+    }
+
 
 def to_message(channel, event):
     """turns one feed event into a message for kafka, or None if there's nothing to send."""
     data = event["d"]
 
     if event["t"] == "featured":
-        # new game on this channel, remember who is playing
+        # new game on this channel, remember who is playing and the time control
         game = {"channel": channel, "game_id": data["id"]}
         for player in data["players"]:
             color = player["color"]  # "white" or "black"
             game[color + "_name"] = player.get("user", {}).get("name")
             game[color + "_rating"] = player.get("rating")
+
+        info = fetch_game_info(data["id"])
+        game["tc_base"] = info["tc_base"]
+        game["tc_inc"] = info["tc_inc"]
         games[channel] = game
-        return {**game, "type": "start", "fen": data["fen"], "received_at": time.time()}
+
+        # the moves so far only go in the start message, the consumer needs them once
+        return {
+            **game,
+            "type": "start",
+            "fen": data["fen"],
+            "moves_so_far": info["moves"],
+            "received_at": time.time(),
+        }
 
     if event["t"] == "fen":
         # a move was played, but we skip it if we don't know the game yet
