@@ -125,3 +125,14 @@ uv run python -m ingest.load_openings
 ```
 
 Downloads the eco.json files from a pinned commit into `data\raw\eco\` and writes the lookup table `data\parquet\openings\openings.parquet` (15,373 positions). Takes a few seconds. Run it before `uv run pytest`, otherwise the opening tests are skipped.
+
+## Blunder model notebook
+
+Needs the parsed moves and the opening book from the two steps above. Build the feature table, once with the full opening book and once with named openings only (for the comparison in the notebook):
+
+```powershell
+uv run python -m ingest.build_features
+uv run python -m ingest.build_features --no-interpolated --out data\parquet\features_named
+```
+
+Each takes about 6 minutes and writes 3.87M rows with 26 features. Then open `notebooks/blunder_model.ipynb` with `uv run jupyter lab` and run all cells (a few minutes).

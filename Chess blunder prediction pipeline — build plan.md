@@ -110,7 +110,9 @@ A 300 centipawn drop while already winning a queen is not a blunder in any usefu
 
 The opening name is not a model feature, but the dashboard shows it.
 
-**Algorithm.** `HistGradientBoostingClassifier` from scikit-learn with class weights. Fast, handles mixed features without scaling, good enough for this assignment.
+Phase 2b added engine-free threat features (pieces attacked, en prise, pinned, king zone, captures and checks available, what the mover could win) and game-history features (recent material change, material below the best point, recent time use). See phase 2b.
+
+**Algorithm.** `HistGradientBoostingClassifier` from scikit-learn. Fast, handles mixed features without scaling, good enough for this assignment. Phase 2 tested class weights and dropped them: same PR-AUC, badly calibrated probabilities.
 
 **Evaluation.** Blunders are a few percent of moves, so accuracy is meaningless here. Report PR-AUC and calibration. Two baselines to beat: the base rate, and a model using clock remaining alone.
 
@@ -214,7 +216,22 @@ First look at the signal: blunder rate is 8.6% with under 10 seconds on the cloc
 - Train `HistGradientBoostingClassifier` with class weights. Compare to the base rate and the clock-only baseline. Report PR-AUC and calibration.
 - Done when: the model clearly beats the clock-only baseline.
 
-**Status (Oct 30): feature module written**, notebook not started. Interface agreed:
+**Status (Oct 30): done, go.** `ingest/build_features.py` replays every parsed game through `compute_features` (3.87M rows, about 2 minutes on 8 workers, `data/parquet/features/`), and `notebooks/blunder_model.ipynb` trains and evaluates. Test set: the newest 11,854 games (last 6 of 30 parts), 760k moves.
+
+| Model | PR-AUC | ROC-AUC | Brier |
+| --- | --- | --- | --- |
+| Base rate | 0.069 | 0.500 | 0.064 |
+| Clock only | 0.086 | 0.591 | 0.064 |
+| All 15 features | **0.156** | 0.743 | 0.061 |
+| All 15, class-weighted | 0.157 | 0.744 | 0.212 |
+
+- The model beats clock only by 1.8× in PR-AUC, and by at least 1.78× in every speed. Flagging the riskiest 5% of moves catches 15% of blunders at 20% precision (2.9× the base rate).
+- **Change from the plan: no class weights.** They don't improve PR-AUC and they ruin calibration (mean prediction 0.41 against a 6.9% blunder rate). The unweighted model is well calibrated, so the dashboard can show its probability directly.
+- Opening features are redundant with move number, piece count and legal moves: removing all three leaves PR-AUC unchanged. We keep them (the join, the dashboard). Named-only versus with interpolated positions makes no difference; we keep the interpolated ones.
+- Strongest features: material balance, mover rating, legal move count, plies out of book. More model capacity does not help (0.157 at most), so the ceiling is the feature set.
+- DAG settings for phase 4: `HistGradientBoostingClassifier(max_iter=500, early_stopping=True, random_state=0)`, no class weights, `features.FEATURES` (26 features after phase 2b).
+
+Interface agreed:
 
 - `features/board.py`: `board_features(board)`. Material balance (mover's view), piece count, in check, legal move count, move number. Needs python-chess, so the batch lane computes these in the parser, not in Spark.
 - `features/openings.py`: `book_features(fen_key, book)` gives `in_book` and the position's ECO letter.
@@ -222,6 +239,26 @@ First look at the signal: blunder rate is 8.6% with under 10 seconds on the cloc
 - `features/__init__.py`: `compute_features(board, clocks, meta, state, book)`, the ordered `FEATURES` list (the training/serving contract), `BLUNDER_THRESHOLD = 0.15` and `is_scored()` (drops bot and UltraBullet games).
 - Conventions: plies count positions (start = 0, python-chess `board.ply()`); the starting position counts as book; missing values stay `None` (HistGradientBoosting handles NaN natively); `time_spent` uses one shared formula `clock_before - clock_after + inc`.
 - Only information available before the move is used: no evals, no clock after the move.
+
+### Phase 2b — Threat and game-history features (A)
+
+Phase 2 showed the feature set was the ceiling, so we added two groups of engine-free features. Both lanes get them through the shared module.
+
+- **Threats** (in `board_features`): own pieces attacked; en prise (attacked and undefended, or attacked by a cheaper piece), their count and the value of the most valuable one; the same value for the opponent's pieces (what the mover could win); pinned pieces; attacked squares around the king; captures and checks available. A proxy for "the right move is hard to find".
+- **History** (in `GameState`): material change over the last 4 plies, material below the mover's best point in the game, average time over the mover's last 3 moves. A proxy for "has the game already gone wrong". Earlier blunders themselves can't be used: the live lane has no evals to detect them.
+
+**Status (Oct 30): done.** The feature table now takes about 6 minutes to build (the check and capture scan over every legal move is the slow part).
+
+| Features | PR-AUC | ROC-AUC |
+| --- | --- | --- |
+| Phase 2 (15) | 0.156 | 0.743 |
+| + threats (23) | 0.174 | 0.766 |
+| + history (18) | 0.157 | 0.745 |
+| All 26 | **0.177** | 0.769 |
+
+- Threats give +12% PR-AUC. The strongest new feature is `opp_en_prise_value`: missing a chance to win material is also a win-probability drop. History adds almost nothing, because material balance already carries most of it. We keep both groups.
+- Overall, 2.1× the clock-only baseline (at least 2.0× in every speed). Flagging the riskiest 5% of moves catches 17% of blunders at 23% precision (3.3× the base rate). Calibration still holds without class weights.
+- For phase 5: the history features are Spark windows too: `lag` over 4 plies for material change, a running max for the drawdown, and a 3-row window over the mover's own moves for the time average.
 
 ### Phase 3 — Redpanda and the TV producer (B, in parallel with 1–2)
 

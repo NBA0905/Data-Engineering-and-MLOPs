@@ -35,7 +35,21 @@ FEATURES = [
     "in_book",
     "plies_out_of_book",
     "eco_family",
+    # Phase 2b: threats on the board (engine-free proxies for "the right move is hard to find")
+    "attacked_pieces",
+    "en_prise_pieces",
+    "en_prise_value",
+    "opp_en_prise_value",
+    "pinned_pieces",
+    "king_zone_attacked",
+    "captures_available",
+    "checks_available",
+    # Phase 2b: how the game has gone so far (engine-free proxies for earlier blunders)
+    "material_change",
+    "material_drawdown",
+    "recent_time_avg",
 ]
+PHASE_2B = FEATURES[FEATURES.index("attacked_pieces"):]
 
 
 def is_scored(white_title: str | None, black_title: str | None, speed: str) -> bool:
@@ -58,8 +72,10 @@ def compute_features(
     `state.record_move(mover, time_spent)`.
     """
     ply = board.ply()
+    board_f = board_features(board)
     book_f = book_features(fen_key(board.fen()), book)
-    state.observe_position(ply, book_f["in_book"], book_f["eco_family"])
+    material_white = board_f["material_balance"] * (1 if board.turn == chess.WHITE else -1)
+    state.observe_position(ply, book_f["in_book"], book_f["eco_family"], material_white)
     mover_elo, opp_elo = meta["mover_elo"], meta["opp_elo"]
     features = {
         "mover_elo": mover_elo,
@@ -68,7 +84,7 @@ def compute_features(
         "tc_inc": meta["tc_inc"],
         "clock": clocks["mover"],
         "opp_clock": clocks["opp"],
-        **board_features(board),
+        **board_f,
         "in_book": book_f["in_book"],
         **state.sequential_features(ply, board.turn),
     }
