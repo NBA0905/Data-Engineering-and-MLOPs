@@ -31,9 +31,8 @@ def risk_bar(probability):
 
 def player_column(moves, color, to_move):
     """name, rating, clock and blunder risk bar for one player, all centred above each other."""
-    side = "w" if color == "white" else "b"
     now = moves.iloc[-1]
-    own = moves[moves["mover"] == side]
+    own = moves[moves["mover"] == color]
     # the risk of this player's latest move, or of the move they're thinking about now
     probability = float(own["blunder_prob"].iloc[-1]) if not own.empty else None
 
@@ -64,11 +63,11 @@ def live_board():
     with black:
         player_column(moves, "black", board.turn == chess.BLACK)
 
-    opening = now["opening_name"] if now["in_book"] else "out of book"
+    opening = now["opening"] if now["in_book"] else "out of book"
     st.caption(f"game {now['game_id']}  ·  move {board.fullmove_number}  ·  {opening}  ·  model v{now['model_version']}")
 
     st.subheader("Blunder risk per move")
-    history = moves.pivot_table(index="ply", columns="mover", values="blunder_prob").rename(columns={"w": "white", "b": "black"})
+    history = moves.pivot_table(index="ply", columns="mover", values="blunder_prob")
     # each ply only has a value for the player to move, so carry the last value forward,
     # otherwise every line has a gap at every other point and nothing gets drawn
     st.line_chart(history.ffill(), x_label="ply", y_label="blunder risk")
