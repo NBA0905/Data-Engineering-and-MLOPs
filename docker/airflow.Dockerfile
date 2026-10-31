@@ -7,6 +7,8 @@ RUN pip install --no-cache-dir \
     --constraint https://raw.githubusercontent.com/apache/airflow/constraints-3.2.0/constraints-3.12.txt \
     apache-airflow==3.2.0 \
     mlflow-skinny==3.17.2 \
+    scikit-learn \
+    skops \
     chess \
     zstandard \
     confluent-kafka \

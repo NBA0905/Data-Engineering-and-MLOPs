@@ -47,9 +47,14 @@ def train_blunder_model():
         return "python -m ingest.land_archive"
 
     @task.bash(cwd=PROJECT)
-    def build_features():
-        """parses the new bronze games into silver/moves/ and gold/features/. the spark job replaces this later."""
-        return "python -m ingest.build_gold_features"
+    def parse_moves():
+        """parses the new bronze games into bronze/moves/ with the board features (needs python-chess)."""
+        return "python -m ingest.parse_bronze"
+
+    @task.bash(cwd=PROJECT)
+    def spark_features():
+        """spark: cleans bronze/moves into silver/moves and builds gold/features."""
+        return "python -m spark.build_features"
 
     @task.bash(cwd=PROJECT)
     def train_model(**context):
@@ -63,7 +68,6 @@ def train_blunder_model():
         """scores challenger and champion on the same test parts and promotes the better one."""
         return f"python -m training.evaluate_model --features {FEATURES} --test-parts {context['params']['test_parts']}"
 
-    replay_archive() >> land_in_bronze() >> build_features() >> train_model() >> evaluate_model()
-
+    replay_archive() >> land_in_bronze() >> parse_moves() >> spark_features() >> train_model() >> evaluate_model()
 
 train_blunder_model()
