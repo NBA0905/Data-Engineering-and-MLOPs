@@ -337,9 +337,15 @@ services:
     user: root
     environment:
       SPARK_NO_DAEMONIZE: "true"
+    # the connect server is the spark driver. the default 1g heap ran out when a client sent
+    # ~1,000 games of local data, and a jvm that ran out of memory keeps failing every request.
+    # so: more heap, and exit on out of memory so docker restarts it instead of leaving it broken
+    restart: unless-stopped
     command: >
       /opt/spark/sbin/start-connect-server.sh
       --master spark://spark-master:7077
+      --conf spark.driver.memory=2g
+      --conf spark.driver.extraJavaOptions=-XX:+ExitOnOutOfMemoryError
       --packages org.apache.hadoop:hadoop-aws:3.4.2
       --conf spark.jars.ivy=/opt/ivy
       --conf spark.hadoop.fs.s3a.endpoint=http://rustfs:9000

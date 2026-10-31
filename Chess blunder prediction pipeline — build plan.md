@@ -300,6 +300,14 @@ Gaps found in the check, to fix before phase 6:
 - Window functions within each game: seconds spent on the previous move, `plies_out_of_book`, rolling features.
 - Write gold features to RustFS. Runs in Spark local mode inside the Airflow task.
 
+**Status (Oct 31): done.** `ingest/parse_bronze.py` parses `bronze/archive/` into `bronze/moves/` with the board features (python-chess, multiprocessing). `spark/build_features.py` cleans into `silver/moves/` and builds `gold/features/` with the opening book join and window functions. The DAG runs them as `parse_moves` → `spark_features`.
+
+- **Change from the plan: a standalone cluster instead of local mode.** Spark master, one worker (2 cores, 2 GB) and a Spark Connect server run in Compose, and the Airflow task is a thin Spark Connect client (`pyspark-client`). The task no longer needs a JVM, but the cluster uses about 3.8 GB while the job runs.
+- Parity: `tests/test_spark_features.py` compares Spark with `GameState` on generated games (needs Spark Connect on `localhost:15002`, otherwise it is skipped). On real data (Oct 31, 24,737 games, 1,607,476 rows), the Spark output equals the earlier Python-built `gold/features` in every feature, the label and the part, apart from bot and UltraBullet games, which Spark now drops in silver and training dropped anyway. Together with `tests/test_live_game.py` this closes the loop: Spark = `GameState` = live consumer.
+- Full job on that data: about 3 minutes parsing, 67 seconds in Spark. Each run rebuilds silver and gold from all of `bronze/moves/`, so the Spark step grows with every batch.
+- Spark Connect is the driver: 2 GB heap, and it exits on out of memory so Docker restarts it (with the 1 GB default it ran out on ~1,000 games of client-side data and then failed every request until restarted).
+- `ingest/build_gold_features.py` is no longer in the DAG; `tests/test_replay_archive.py` still imports from it.
+
 ### Phase 6 — Live consumer (B)
 
 - Consume `tv.moves`, load the opening book from `gold/openings/` into memory at startup, compute features with the same `features/` module, load `models:/blunder@champion`, write predictions to Postgres.
