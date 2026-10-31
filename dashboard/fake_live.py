@@ -1,6 +1,6 @@
 """dev helper: plays random games and writes made-up predictions, so the live page can be built and
-tested before the live consumer exists. not part of the pipeline, the real predictions come from
-the consumer.
+tested without the live consumer. not part of the pipeline, the real predictions come from
+the consumer. it writes to the same live_predictions table, with game ids starting with 'fake'.
 
 run with: uv run python -m dashboard.fake_live
 """
@@ -10,34 +10,10 @@ import time
 
 import chess
 import psycopg2
+from psycopg2.extras import Json
 
+from consumer.score_moves import CREATE_TABLE, INSERT
 from dashboard.lake import CHESS_DB_URL
-
-# the table the live consumer writes to (agreed with the consumer side)
-CREATE_TABLE = """
-CREATE TABLE IF NOT EXISTS predictions (
-    id            SERIAL PRIMARY KEY,
-    created_at    TIMESTAMPTZ DEFAULT now(),
-    channel       TEXT,
-    game_id       TEXT,
-    ply           INTEGER,
-    fen           TEXT,
-    last_move     TEXT,
-    mover         TEXT,
-    white_name    TEXT, white_rating INTEGER, white_clock REAL,
-    black_name    TEXT, black_rating INTEGER, black_clock REAL,
-    opening_name  TEXT,
-    in_book       BOOLEAN,
-    blunder_prob  REAL,
-    model_version INTEGER
-)
-"""
-
-INSERT = """
-INSERT INTO predictions (channel, game_id, ply, fen, last_move, mover, white_name, white_rating, white_clock,
-                         black_name, black_rating, black_clock, opening_name, in_book, blunder_prob, model_version)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-"""
 
 
 def play_game(cur, channel):
@@ -49,11 +25,18 @@ def play_game(cur, channel):
         move = random.choice(list(board.legal_moves))
         clocks[board.turn] -= random.uniform(1, 15)
         board.push(move)
-        mover = "w" if board.turn == chess.WHITE else "b"  # the player about to move
-        cur.execute(INSERT, (channel, game_id, board.ply(), board.fen(), move.uci(), mover,
-                             "FakeWhite", 2100, max(clocks[chess.WHITE], 0), "FakeBlack", 2050, max(clocks[chess.BLACK], 0),
-                             "Sicilian Defense" if board.ply() < 8 else None, board.ply() < 8,
-                             random.betavariate(1.2, 12), 1))
+        mover = "white" if board.turn == chess.WHITE else "black"  # the player about to move
+        in_book = board.ply() < 8
+        cur.execute(INSERT, {
+            "game_id": game_id, "ply": board.ply(), "channel": channel, "speed": channel,
+            "fen": board.fen(), "last_move": move.uci(), "mover": mover,
+            "white_name": "FakeWhite", "black_name": "FakeBlack", "white_rating": 2100, "black_rating": 2050,
+            "white_clock": max(int(clocks[chess.WHITE]), 0), "black_clock": max(int(clocks[chess.BLACK]), 0),
+            "eco": "B20" if in_book else None, "opening": "Sicilian Defense" if in_book else None,
+            "in_book": in_book, "plies_out_of_book": max(board.ply() - 8, 0),
+            "blunder_prob": random.betavariate(1.2, 12), "model_version": 1,
+            "features": Json({}), "received_at": time.time(),
+        })
         time.sleep(2)
 
 

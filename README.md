@@ -45,6 +45,80 @@ The project uses [uv](https://docs.astral.sh/uv/) for Python and dependencies. D
 
 Adding a dependency: `uv add <package>` (or `uv add --dev <package>` for notebook and test tools). Commit both `pyproject.toml` and `uv.lock`.
 
+## Running everything end-to-end
+
+From a fresh clone to live blunder predictions on the dashboard. The steps build on each other, so run them in order. The sections further down explain each part in detail.
+
+### 1. Prerequisites
+
+- Docker Desktop running, with plenty of memory for Docker: the Spark Connect driver and the Spark worker take 2 GB each and Redpanda 1 GB, on top of Airflow, MLflow and Postgres.
+- uv and `uv sync` done, see [Local setup](#local-setup).
+- The 3 GB archive in `data\raw\`, see [Downloading the game archive](#downloading-the-game-archive-3-gb). The training DAG reads it from there through the project mount.
+- Windows only: nothing else on port 5432. A local PostgreSQL installation takes those connections first, see [Troubleshooting](#troubleshooting-on-windows).
+
+### 2. Start the stack
+
+```powershell
+docker compose up -d --build
+docker compose ps
+```
+
+The first start builds the images and Spark Connect downloads its S3 connector, which takes a few minutes. Wait until `airflow-apiserver` and `spark-master` show `healthy`. The live services start too, but `live-scorer` keeps restarting until step 4 has made a champion model. That is expected.
+
+| UI | URL | Login |
+| --- | --- | --- |
+| Airflow | http://localhost:8080 | airflow / airflow |
+| MLflow | http://localhost:5000 | |
+| RustFS (data lake) | http://localhost:9001 | rustfsadmin / rustfsadmin |
+| Redpanda Console | http://localhost:8085 | |
+| pgAdmin | http://localhost:5050 | |
+| Spark master | http://localhost:8088 | |
+
+### 3. Opening book
+
+In Airflow, unpause the `opening_book` DAG (DAGs are paused when they are created). It runs once by itself: it creates the buckets `bronze`, `silver`, `gold` and `mlflow`, and writes `gold/openings/openings.parquet`. Takes under a minute.
+
+### 4. Train the first model
+
+Unpause `train_blunder_model` and trigger it (▶). The first run replays 20,000 games, builds the features with Spark, trains a model and promotes it to `champion`, because there is no champion yet. For a quicker demo, trigger it with a smaller `backfill` param, but the model is then trained on fewer games.
+
+When the run is green, MLflow shows model `blunder` with the `champion` alias. After that the DAG retrains every 6 hours on the next 5,000 games, and only promotes the new model if it scores better.
+
+### 5. Live lane
+
+Restart the scorer so it loads the champion straight away instead of waiting for its next restart:
+
+```powershell
+docker compose restart live-scorer
+docker compose logs -f live-scorer
+```
+
+Within a minute the log shows lines like `[blitz] Iu3PrBcg ply 38 d7c5: white to move, blunder risk 5.1%`. The predictions go to the `live_predictions` table in Postgres (database `chess`), and the raw feed lands in `bronze/tv/` every 5 minutes.
+
+### 6. Dashboard
+
+```powershell
+uv run streamlit run dashboard/app.py --server.port 8600
+```
+
+Open http://localhost:8600. **Live** shows the game on the chosen TV channel with the blunder risk of both players, **Data** shows where blunders happen in `gold/features`, and **Model** shows every retrain from MLflow.
+
+### Stopping
+
+`docker compose stop` stops everything and keeps all data. `docker compose down -v` also deletes the volumes (Postgres, RustFS, Redpanda), so you start again from step 2.
+
+### Troubleshooting on Windows
+
+- **`password authentication failed for user "airflow"`** from anything you run with `uv run`: a local PostgreSQL service is using port 5432. Containers are not affected, only scripts on the host. Stop it and keep it from starting at boot, in PowerShell as administrator (use your own version number):
+
+  ```powershell
+  Stop-Service postgresql-x64-16
+  Set-Service postgresql-x64-16 -StartupType Manual
+  ```
+
+- **`Port 8501 is not available`** while nothing uses it: Windows reserves port ranges for Hyper-V/WSL, which Docker uses, and the range can include Streamlit's default port. `netsh interface ipv4 show excludedportrange protocol=tcp` lists them. Use a port outside those ranges, like `--server.port 8600` above.
+- **Live page says "No predictions for … yet"**: check `docker compose logs live-scorer`. It needs a champion model (step 4) and the opening book (step 3).
+
 ## Downloading the game archive (3 GB)
 
 Training data comes from the [Lichess open database](https://database.lichess.org/). A monthly file is about 29 GB, but the whole project needs only a few percent of one month. We therefore download just the **first 3 GB** of the September 2026 file with an HTTP range request. That slice holds millions of games, of which about 10% carry engine evaluations.
@@ -179,4 +253,4 @@ docker compose logs -f live-scorer
 
 Scoring and landing use separate consumer groups (`live-scorer`, `bronze-tv`), so one never holds up the other. The scorer stores a Kafka offset only after its prediction is written, and a prediction is unique per `(game_id, ply)`, so restarts neither lose nor duplicate rows. On its very first start the scorer begins at the newest message; `--from-start` scores what is already on the topic.
 
-Outside Docker the same commands run with `uv run python -m ...`, but only if `localhost:5432` reaches the Docker Postgres. A local Windows PostgreSQL service on the same port takes those connections first (`password authentication failed for user "airflow"`); stop it, or run the scorer in Docker.
+Outside Docker the same commands run with `uv run python -m ...`, but only if `localhost:5432` reaches the Docker Postgres, see [Troubleshooting on Windows](#troubleshooting-on-windows).

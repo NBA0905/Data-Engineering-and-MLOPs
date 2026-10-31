@@ -53,7 +53,7 @@ def champion():
     return {"version": int(version.version), "run_id": version.run_id}
 
 
-# ---- live predictions, written to postgres by the live consumer ----
+# ---- live predictions, written to postgres by the live consumer (consumer/score_moves.py) ----
 
 CHESS_DB_URL = os.environ.get("CHESS_DB_URL", "postgresql://airflow:airflow@localhost:5432/chess")
 
@@ -70,11 +70,12 @@ def current_game(channel):
     try:
         with conn.cursor() as cur:
             # the newest prediction on this channel tells us which game is on now
-            cur.execute("SELECT game_id FROM predictions WHERE channel = %s ORDER BY id DESC LIMIT 1", (channel,))
+            cur.execute("SELECT game_id FROM live_predictions WHERE channel = %s ORDER BY scored_at DESC LIMIT 1",
+                        (channel,))
             row = cur.fetchone()
             if row is None:
                 return pd.DataFrame()
-            cur.execute("SELECT * FROM predictions WHERE game_id = %s ORDER BY id", (row[0],))
+            cur.execute("SELECT * FROM live_predictions WHERE game_id = %s ORDER BY ply", (row[0],))
             columns = [column.name for column in cur.description]
             return pd.DataFrame(cur.fetchall(), columns=columns)
     except psycopg2.Error:
