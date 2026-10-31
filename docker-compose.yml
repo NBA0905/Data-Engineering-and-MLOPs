@@ -33,6 +33,7 @@ x-airflow-common:
     KAFKA_BOOTSTRAP: redpanda-0:9092
     RUSTFS_ENDPOINT: http://rustfs:9000
     MLFLOW_TRACKING_URI: http://mlflow:5000
+    CHESS_DB_URL: postgresql://airflow:airflow@postgres:5432/chess
   volumes:
     - ./dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
