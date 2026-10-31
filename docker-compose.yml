@@ -10,6 +10,23 @@ volumes:
   postgres-db-volume: null
   spark-ivy: null
 
+x-live-common:
+  &live-common
+  build:
+    context: .
+    dockerfile: docker/live.Dockerfile
+  image: chess-blunder-live
+  environment:
+    KAFKA_BOOTSTRAP: redpanda-0:9092
+    RUSTFS_ENDPOINT: http://rustfs:9000
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    CHESS_DB_URL: postgresql://airflow:airflow@postgres:5432/chess
+  volumes:
+    - .:/app
+  networks:
+    - chess_network
+  restart: unless-stopped
+
 x-airflow-common:
   &airflow-common
   build:
@@ -66,6 +83,7 @@ services:
       - --advertise-rpc-addr redpanda-0:33145
       - --mode dev-container
       - --smp 1
+      - --memory 1G
       - --default-log-level=info
     volumes:
       - redpanda-0:/var/lib/redpanda/data
@@ -250,6 +268,34 @@ services:
       _AIRFLOW_WWW_USER_PASSWORD: airflow
     user: "0:0"
 
+  # the live lane: long-running services, not airflow tasks
+  tv-producer:
+    <<: *live-common
+    container_name: tv-producer
+    command: python -m ingest.tv_producer bullet blitz rapid classical
+    depends_on:
+      - redpanda-0
+
+  live-scorer:
+    <<: *live-common
+    container_name: live-scorer
+    command: python -m consumer.score_moves
+    depends_on:
+      redpanda-0:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+
+  tv-lander:
+    <<: *live-common
+    container_name: tv-lander
+    command: python -m consumer.land_tv
+    stop_grace_period: 30s
+    depends_on:
+      - redpanda-0
+      - rustfs
   spark-master:
     image: apache/spark:4.1.1
     container_name: spark-master
@@ -291,9 +337,23 @@ services:
     user: root
     environment:
       SPARK_NO_DAEMONIZE: "true"
+    # the connect server is the spark driver. the default 1g heap ran out when a client sent
+    # ~1,000 games of local data, and a jvm that ran out of memory keeps failing every request.
+    # so: more heap, and exit on out of memory so docker restarts it instead of leaving it broken.
+    # dynamic allocation: one executor with both worker cores, stopped after 15 s idle, so the
+    # worker's memory is free again by the time the training task loads its data. shuffle data is
+    # not kept longer either: every dag run is a new session and never reuses the previous one's
+    restart: unless-stopped
     command: >
       /opt/spark/sbin/start-connect-server.sh
       --master spark://spark-master:7077
+      --conf spark.driver.memory=2g
+      --conf spark.driver.extraJavaOptions=-XX:+ExitOnOutOfMemoryError
+      --conf spark.executor.cores=2
+      --conf spark.dynamicAllocation.enabled=true
+      --conf spark.dynamicAllocation.shuffleTracking.enabled=true
+      --conf spark.dynamicAllocation.executorIdleTimeout=15s
+      --conf spark.dynamicAllocation.shuffleTracking.timeout=15s
       --packages org.apache.hadoop:hadoop-aws:3.4.2
       --conf spark.jars.ivy=/opt/ivy
       --conf spark.hadoop.fs.s3a.endpoint=http://rustfs:9000

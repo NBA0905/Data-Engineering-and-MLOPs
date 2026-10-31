@@ -40,19 +40,24 @@ def fetch_game_info(game_id):
     """asks lichess once per game for the time control and the moves played so far."""
     url = GAME_URL.format(game_id=game_id)
     try:
-        response = requests.get(url, headers={"Accept": "application/json"}, timeout=10)
+        response = requests.get(url, params={"clocks": "true"}, headers={"Accept": "application/json"}, timeout=10)
         response.raise_for_status()
         info = response.json()
     except requests.exceptions.RequestException as error:
         # not the end of the world, the game just gets sent without a time control
         print(f"could not fetch game {game_id} ({error})")
-        return {"tc_base": None, "tc_inc": None, "moves": ""}
+        return {"tc_base": None, "tc_inc": None, "variant": None, "moves": "", "clocks": []}
 
     clock = info.get("clock", {})
+    moves = info.get("moves", "")
     return {
         "tc_base": clock.get("initial"),  # starting time in seconds
         "tc_inc": clock.get("increment"),  # seconds added per move
-        "moves": info.get("moves", ""),  # moves so far, like "e4 e5 Nf3"
+        "variant": info.get("variant"),  # "standard", "chess960", ... the model only knows standard
+        "moves": moves,  # moves so far, like "e4 e5 Nf3"
+        # mover's clock after each of those moves, in whole seconds like the feed. lichess sends
+        # centiseconds and one extra value at the end, which we drop
+        "clocks": [round(c / 100) for c in info.get("clocks", [])[: len(moves.split())]],
     }
 
 
@@ -66,19 +71,25 @@ def to_message(channel, event):
         for player in data["players"]:
             color = player["color"]  # "white" or "black"
             game[color + "_name"] = player.get("user", {}).get("name")
+            game[color + "_title"] = player.get("user", {}).get("title")  # "BOT" games are not scored
             game[color + "_rating"] = player.get("rating")
 
         info = fetch_game_info(data["id"])
         game["tc_base"] = info["tc_base"]
         game["tc_inc"] = info["tc_inc"]
+        game["variant"] = info["variant"]
         games[channel] = game
 
-        # the moves so far only go in the start message, the consumer needs them once
+        # the moves so far only go in the start message, the consumer needs them once.
+        # lichess delays the export of a running game, so they can end a few moves before `fen`.
+        # the featured event's fen has its move counters reset ("0 1") and its `seconds` are
+        # not the real clocks, so the consumer only trusts the fen and clocks of move messages
         return {
             **game,
             "type": "start",
             "fen": data["fen"],
             "moves_so_far": info["moves"],
+            "clocks_so_far": info["clocks"],
             "received_at": time.time(),
         }
 
@@ -99,6 +110,12 @@ def to_message(channel, event):
     return None
 
 
+def on_delivery(error, message):
+    """called by the kafka client for every message once redpanda has (not) stored it."""
+    if error is not None:
+        print(f"could not send message for game {message.key().decode()} ({error})")
+
+
 def run_channel(channel):
     """reads one channel forever and sends each message to the topic."""
     for event in read_feed(channel):
@@ -106,7 +123,7 @@ def run_channel(channel):
         if message is None:
             continue
         # game id as key so all moves of one game land in the same partition
-        producer.produce(TOPIC, key=message["game_id"], value=json.dumps(message))
+        producer.produce(TOPIC, key=message["game_id"], value=json.dumps(message), on_delivery=on_delivery)
         producer.poll(0)
         print(f"[{channel}] {message['type']} {message['game_id']} {message.get('last_move', '')}")
 

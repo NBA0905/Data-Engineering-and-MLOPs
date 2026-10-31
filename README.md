@@ -137,15 +137,16 @@ uv run python -m ingest.build_features --no-interpolated --out data\parquet\feat
 
 Each takes about 6 minutes and writes 3.87M rows with 26 features. Then open `notebooks/blunder_model.ipynb` with `uv run jupyter lab` and run all cells (a few minutes).
 
-## Training DAG (archive replay → bronze → features → train → evaluate)
+## Training DAG (archive replay → bronze → Spark features → train → evaluate)
 
-The batch lane runs in Airflow as the `train_blunder_model` DAG, every 6 hours. Run the `opening_book` DAG once first: the features step needs `gold/openings/`.
+The batch lane runs in Airflow as the `train_blunder_model` DAG, every 6 hours. Run the `opening_book` DAG once first: the Spark step needs `gold/openings/`. The Spark services (`spark-master`, `spark-worker`, `spark-connect`) must be up; the DAG talks to Spark Connect on `spark-connect:15002`.
 
 | Task | Script | What it does |
 | --- | --- | --- |
 | `replay_archive` | `ingest.replay_archive` | Sends the next annotated games from the archive to the `games.archive` topic and saves the position in the `archive_checkpoint` table (Postgres, database `chess`). The first run sends 20,000 games, every run after that 5,000. |
 | `land_in_bronze` | `ingest.land_archive` | Writes every message on `games.archive` the `bronze-archive` consumer group has not landed yet to `bronze/archive/` as Parquet, then commits the offsets. |
-| `build_features` | `ingest.build_gold_features` | Parses new bronze files into `silver/moves/` and builds their features into `gold/features/`. Stand-in for the Spark job (phase 5). |
+| `parse_moves` | `ingest.parse_bronze` | Parses every new file in `bronze/archive/` into `bronze/moves/`, one row per move with the board features. Plain Python with multiprocessing, because PGN parsing and the board features need python-chess. |
+| `spark_features` | `spark.build_features` | Spark: drops bot and UltraBullet games and duplicates into `silver/moves/`, joins the opening book on the FEN key and computes the per-game history features with window functions into `gold/features/`. Rebuilds both from all of `bronze/moves/` on every run. |
 | `train_model` | `training.train_model` | Trains on `s3://gold/features`, newest 3 parts (6,000 games) held out, 27 parts before them as the training window, registers the `challenger`. |
 | `evaluate_model` | `training.evaluate_model` | Scores challenger and champion on the same 3 parts, promotes the better one. |
 
@@ -154,8 +155,28 @@ Batch sizes, test parts and training window are DAG params, so a manual trigger 
 ```powershell
 uv run python -m ingest.replay_archive data\raw\lichess_db_standard_rated_2026-09.part.pgn.zst --games 1000
 uv run python -m ingest.land_archive
-uv run python -m ingest.build_gold_features
+uv run python -m ingest.parse_bronze
+uv run python -m spark.build_features
 uv run python -m training.train_model --features s3://gold/features --test-parts 3 --train-parts 27
 ```
 
 To replay the archive from the start again, delete its row from `archive_checkpoint` (pgAdmin, database `chess`).
+
+## Live lane (TV feed → Redpanda → scorer → Postgres, bronze)
+
+Three long-running services in Docker Compose, all from `docker/live.Dockerfile` (dependencies from `uv.lock`, code mounted at `/app`). Needs the `champion` model in MLflow and the opening book in `gold/openings/` (run the `opening_book` DAG once).
+
+```powershell
+docker compose up -d --build tv-producer live-scorer tv-lander
+docker compose logs -f live-scorer
+```
+
+| Service | Script | What it does |
+| --- | --- | --- |
+| `tv-producer` | `ingest.tv_producer` | Reads the bullet, blitz, rapid and classical TV channels and sends a `start` message per game (players, titles, time control, variant, moves and clocks so far) and a `move` message per move to `tv.moves`, keyed by game id. |
+| `live-scorer` | `consumer.score_moves` | Keeps one `consumer.live_game.LiveGame` per game, computes the features of every position with the shared `features` module and writes the `blunder@champion` probability for the move about to be played to `live_predictions` (Postgres, database `chess`). Checks every 5 minutes whether the champion alias moved and loads the new version. |
+| `tv-lander` | `consumer.land_tv` | Writes the raw messages to `bronze/tv/date=YYYY-MM-DD/` as Parquet every 5 minutes, and once more on `docker compose stop`. |
+
+Scoring and landing use separate consumer groups (`live-scorer`, `bronze-tv`), so one never holds up the other. The scorer stores a Kafka offset only after its prediction is written, and a prediction is unique per `(game_id, ply)`, so restarts neither lose nor duplicate rows. On its very first start the scorer begins at the newest message; `--from-start` scores what is already on the topic.
+
+Outside Docker the same commands run with `uv run python -m ...`, but only if `localhost:5432` reaches the Docker Postgres. A local Windows PostgreSQL service on the same port takes those connections first (`password authentication failed for user "airflow"`); stop it, or run the scorer in Docker.
