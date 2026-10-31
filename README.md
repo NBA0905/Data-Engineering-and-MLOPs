@@ -159,3 +159,22 @@ uv run python -m training.train_model --features s3://gold/features --test-parts
 ```
 
 To replay the archive from the start again, delete its row from `archive_checkpoint` (pgAdmin, database `chess`).
+
+## Live lane (TV feed → Redpanda → scorer → Postgres, bronze)
+
+Three long-running services in Docker Compose, all from `docker/live.Dockerfile` (dependencies from `uv.lock`, code mounted at `/app`). Needs the `champion` model in MLflow and the opening book in `gold/openings/` (run the `opening_book` DAG once).
+
+```powershell
+docker compose up -d --build tv-producer live-scorer tv-lander
+docker compose logs -f live-scorer
+```
+
+| Service | Script | What it does |
+| --- | --- | --- |
+| `tv-producer` | `ingest.tv_producer` | Reads the bullet, blitz, rapid and classical TV channels and sends a `start` message per game (players, titles, time control, variant, moves and clocks so far) and a `move` message per move to `tv.moves`, keyed by game id. |
+| `live-scorer` | `consumer.score_moves` | Keeps one `consumer.live_game.LiveGame` per game, computes the features of every position with the shared `features` module and writes the `blunder@champion` probability for the move about to be played to `live_predictions` (Postgres, database `chess`). Checks every 5 minutes whether the champion alias moved and loads the new version. |
+| `tv-lander` | `consumer.land_tv` | Writes the raw messages to `bronze/tv/date=YYYY-MM-DD/` as Parquet every 5 minutes, and once more on `docker compose stop`. |
+
+Scoring and landing use separate consumer groups (`live-scorer`, `bronze-tv`), so one never holds up the other. The scorer stores a Kafka offset only after its prediction is written, and a prediction is unique per `(game_id, ply)`, so restarts neither lose nor duplicate rows. On its very first start the scorer begins at the newest message; `--from-start` scores what is already on the topic.
+
+Outside Docker the same commands run with `uv run python -m ...`, but only if `localhost:5432` reaches the Docker Postgres. A local Windows PostgreSQL service on the same port takes those connections first (`password authentication failed for user "airflow"`); stop it, or run the scorer in Docker.

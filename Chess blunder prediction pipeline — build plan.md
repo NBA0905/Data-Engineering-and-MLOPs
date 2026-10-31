@@ -313,6 +313,17 @@ Ready from phase 4 (Oct 31): the champion is registered, so the consumer can be 
 - Check at startup that the champion run's `features` tag equals `features.FEATURES`.
 - Handle the producer gaps listed under phase 3 (titles, starting clocks, the lag in `moves_so_far`).
 
+**Status (Oct 31): done, except the Spark side of the parity test (waits for phase 5).**
+
+- `consumer/live_game.py`: `LiveGame`, the per-game state of the live lane. Every `move` message gives the position after the move, so the consumer scores the move the player to move is about to make. The board always comes from the move message's FEN. The time spent on the previous move comes from two consecutive positions' clocks, using the parser's formula.
+- **The `featured` FEN is not trustworthy.** Checked on the live feed (Oct 31): its move counters are reset (`0 1`, sometimes with the wrong side to move) and both players' `seconds` are the same value. Start messages are therefore only used to warm up a game, never scored, and the producer no longer sends their clocks.
+- Producer gaps from phase 3 fixed: titles are stamped on every message, the start message carries the variant and the clocks so far (`/game/export?clocks=true`, centiseconds rounded to whole seconds like the feed; the export has one clock more than moves, which we drop), failed sends are logged through a delivery callback, and Redpanda runs with `--memory 1G`.
+- Joining mid-game: the moves and clocks so far are replayed through `compute_features`, which gives the same state as the batch lane. When the export lags behind the live position, the missing plies' material is assumed unchanged and the time features catch up after one move per side. After a scorer restart, games already in progress continue without history (`plies_out_of_book` counts from the start of the game).
+- `consumer/score_moves.py`: consumer group `live-scorer`, loads the book from `gold/openings/`, checks the champion's `features` tag against `features.FEATURES` at load, reloads when the alias moves, and writes to `live_predictions` (one row per game and ply, with the feature vector as `jsonb` for the dashboard). Standard variant only, bots and UltraBullet skipped.
+- `consumer/land_tv.py`: consumer group `bronze-tv`, raw messages as JSON text plus filter columns, one Parquet file per partition every 5 minutes, offsets committed after the upload.
+- Parity: `tests/test_live_game.py` sends one game through the batch lane (`parse_game` → `game_features`) and through `LiveGame` as feed messages, watched from the start and joined at several plies. All 26 features are identical at every ply. Once the Spark job exists, add its output for the same game to this test.
+- End-to-end run (Oct 31, all four channels, in Docker): 91 positions scored in 90 seconds, mean probability 3–7% per channel, and 661 raw events landed in `bronze/tv/`.
+
 ### Phase 7 — Opening book lookup (B)
 
 - Airflow task `load_openings`: download `ecoA.json` … `ecoE.json` from a pinned commit into `bronze/eco/`.

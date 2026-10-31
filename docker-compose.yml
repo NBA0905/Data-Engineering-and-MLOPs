@@ -9,6 +9,23 @@ volumes:
   rustfs-data: null
   postgres-db-volume: null
 
+x-live-common:
+  &live-common
+  build:
+    context: .
+    dockerfile: docker/live.Dockerfile
+  image: chess-blunder-live
+  environment:
+    KAFKA_BOOTSTRAP: redpanda-0:9092
+    RUSTFS_ENDPOINT: http://rustfs:9000
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    CHESS_DB_URL: postgresql://airflow:airflow@postgres:5432/chess
+  volumes:
+    - .:/app
+  networks:
+    - chess_network
+  restart: unless-stopped
+
 x-airflow-common:
   &airflow-common
   build:
@@ -64,6 +81,7 @@ services:
       - --advertise-rpc-addr redpanda-0:33145
       - --mode dev-container
       - --smp 1
+      - --memory 1G
       - --default-log-level=info
     volumes:
       - redpanda-0:/var/lib/redpanda/data
@@ -246,3 +264,32 @@ services:
       _AIRFLOW_WWW_USER_USERNAME: airflow
       _AIRFLOW_WWW_USER_PASSWORD: airflow
     user: "0:0"
+
+  # the live lane: long-running services, not airflow tasks
+  tv-producer:
+    <<: *live-common
+    container_name: tv-producer
+    command: python -m ingest.tv_producer bullet blitz rapid classical
+    depends_on:
+      - redpanda-0
+
+  live-scorer:
+    <<: *live-common
+    container_name: live-scorer
+    command: python -m consumer.score_moves
+    depends_on:
+      redpanda-0:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+
+  tv-lander:
+    <<: *live-common
+    container_name: tv-lander
+    command: python -m consumer.land_tv
+    stop_grace_period: 30s
+    depends_on:
+      - redpanda-0
+      - rustfs
