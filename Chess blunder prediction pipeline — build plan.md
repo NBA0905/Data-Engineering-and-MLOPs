@@ -116,7 +116,7 @@ Phase 2b added engine-free threat features (pieces attacked, en prise, pinned, k
 
 **Evaluation.** Blunders are a few percent of moves, so accuracy is meaningless here. Report PR-AUC and calibration. Two baselines to beat: the base rate, and a model using clock remaining alone.
 
-**Retraining and promotion.** Every DAG run logs parameters, metrics and the model to MLflow and registers a new version. The split is by time: the newest replayed batch is the test set and is never trained on in that run. The new version and the current `champion` are both scored on that same batch. If the new version has the higher PR-AUC, the `champion` alias moves to it. The live consumer always loads `models:/blunder@champion`.
+**Retraining and promotion.** Every DAG run logs parameters, metrics and the model to MLflow and registers a new version under the `challenger` alias. The split is by time: the newest replayed batch is the test set and is never trained on in that run. The new version and the current `champion` are both scored on that same batch. If the new version has the higher PR-AUC, the `champion` alias moves to it. The live consumer always loads `models:/blunder@champion`.
 
 **Replay and retraining schedule.** Proposed defaults, all configurable as Airflow params:
 
@@ -266,12 +266,32 @@ Phase 2 showed the feature set was the ceiling, so we added two groups of engine
 - Producer with one connection per channel. Holds game metadata from each `featured` event in memory and stamps every move event with it. Handles game switches.
 - Publishes to `tv.moves`, keyed by game id.
 
+**Status (Oct 31): done.** Redpanda v25.1.1 (`--mode dev-container --smp 1`, Kafka on `localhost:19092`) and Console (`localhost:8085`) in `docker-compose.yml`. `ingest/tv_producer.py` runs one thread per channel (`uv run python -m ingest.tv_producer rapid blitz`). On each `featured` event it fetches the game once from `/game/export/{id}` for the time control and the moves so far, sends a `start` message, then stamps every `move` message with the game metadata. A 45 second run on rapid and blitz put 18 messages on `tv.moves` (1 partition, auto-created). Tests in `tests/test_tv_producer.py`.
+
+Gaps found in the check, to fix before phase 6:
+
+- The producer drops `user.title` from the `featured` players, but `is_scored()` needs both titles to skip bot games.
+- It also drops the players' `seconds` from the `featured` event, so the consumer has no clock for the first move after joining a game.
+- `moves_so_far` lags the live position: Lichess delays exports of ongoing games, and both captured games replayed to ply 50 while the start FEN was at ply 53. The consumer must trust the FEN and accept a small gap in the history features when it joins mid-game.
+- No delivery callback, so failed sends go unnoticed. Redpanda runs without `--memory 1G`.
+
 ### Phase 4 — Storage, tracking and orchestration (A)
 
 - Add RustFS (S3 API), Postgres, MLflow (Postgres backend, artifacts on RustFS) and Airflow with `LocalExecutor` to Compose.
 - Archive replay producer: reads the next N annotated games from the `.pgn.zst`, publishes them to `games.archive`, saves the offset in a Postgres checkpoint table. Resumes from the checkpoint on the next run.
 - A consumer task writes `games.archive` to `bronze/archive/` on RustFS.
 - DAG `train_blunder_model` (every 6 hours, see the replay and retraining schedule): replay next batch → land in bronze → Spark features → train → evaluate on newest batch → register → promote `champion` if better.
+
+**Status (Oct 31): storage, tracking and training done; Airflow, replay and DAG still to do.**
+
+- Compose (B) adds RustFS (S3 API on `localhost:9000`, console on `9001`), Postgres 16 (databases `airflow`, `mlflow`, `chess`; `docker/postgres-init.sql` only runs when the volume is first created), pgAdmin (`localhost:5050`) and MLflow 3.17.2 (`localhost:5000`, Postgres backend, artifacts in the `mlflow` bucket, same version as `uv.lock`). `storage/create_buckets.py` creates `bronze`, `silver`, `gold` and `mlflow`; `storage/check_setup.py` checks MLflow logs to Postgres and RustFS.
+- `training/train_model.py` trains with the phase 2 settings on the feature table, holds out the newest 6 parts, logs parameters, metrics (incl. the clock-only baseline and the lift over it) and the feature list as the `features` tag, registers the version and gives it the `challenger` alias.
+- `training/evaluate_model.py` scores `@challenger` and `@champion` on the same held-out parts, logs the comparison as its own run (`evaluate v<n>`, tag `promoted`), moves `champion` if the challenger's PR-AUC is strictly higher (or there is no champion yet), and removes the `challenger` alias. These become the train and evaluate tasks of the DAG. The `champion` alias can still be moved by hand in the MLflow UI, for a rollback or the demo.
+- **`blunder` v1 is champion**: PR-AUC 0.177, ROC-AUC 0.769, clock only 0.086 (2.1×), mean prediction 6.9% against a 7.1% blunder rate, the same as the notebook. A retrain with the same data gave an identical v2 (`random_state=0`), which the evaluation correctly did not promote on the tie.
+- `features.model_input(rows)` turns feature dicts into the dtypes the model was trained on (booleans as 0/1, `eco_family` as a categorical over A–E). Training and the consumer both call it; scoring one dict at a time gives exactly the same probabilities as scoring a DataFrame.
+- **MLflow artifacts from the host.** The server tells clients to download artifacts straight from RustFS via presigned links to `http://rustfs:9000`, a name that only resolves inside the Docker network. From Windows every model load stalled on retries. `storage.tracking.connect()` sets the tracking URI and switches the client to download and upload through the MLflow server; loading the champion now takes about 3 seconds. Every script that talks to MLflow from the host calls it; containers on `chess_network` don't need it.
+- **Model serialisation.** MLflow 3.17 saves sklearn models with skops and refuses types that are not on its allow list. `SKOPS_TRUSTED` in `train_model.py` lists the three HistGradientBoosting internals it flagged. We keep skops rather than switching to cloudpickle, which would run arbitrary code on load.
+- Still to do: Airflow (`LocalExecutor`) in Compose, the archive replay producer with its checkpoint table, landing `games.archive` in `bronze/archive/`, uploading the opening book to `bronze/eco/` and `gold/openings/`, and the `train_blunder_model` DAG.
 
 ### Phase 5 — Spark job (A)
 
@@ -286,6 +306,12 @@ Phase 2 showed the feature set was the ceiling, so we added two groups of engine
 - Keep small per-game state (previous clock, last in-book ply) and reset it on a `featured` game switch.
 - Write raw events to `bronze/tv/` on RustFS.
 - Test that a known position produces identical feature vectors through the Spark path and the consumer path.
+
+Ready from phase 4 (Oct 31): the champion is registered, so the consumer can be built against it now.
+
+- Call `storage.tracking.connect()` before any MLflow call when running on the host, load the model with `mlflow.sklearn.load_model("models:/blunder@champion")`, and score with `model.predict_proba(model_input([features]))[0, 1]`.
+- Check at startup that the champion run's `features` tag equals `features.FEATURES`.
+- Handle the producer gaps listed under phase 3 (titles, starting clocks, the lag in `moves_so_far`).
 
 ### Phase 7 — Opening book lookup (B)
 

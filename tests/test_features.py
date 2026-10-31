@@ -1,6 +1,6 @@
 import chess
 
-from features import FEATURES, GameState, compute_features, is_scored
+from features import FEATURES, GameState, compute_features, is_scored, model_input
 from features.board import board_features
 from features.clock import time_spent
 from features.fen import fen_key
@@ -170,3 +170,14 @@ def test_is_scored_excludes_bots_and_ultrabullet():
     assert is_scored("GM", None, "rapid")
     assert not is_scored(None, "BOT", "blitz")
     assert not is_scored(None, None, "ultraBullet")
+
+
+def test_model_input_matches_the_training_dtypes():
+    features = compute_features(chess.Board(), {"mover": 180, "opp": 180},
+                                {"mover_elo": 1500, "opp_elo": None, "tc_base": 180, "tc_inc": 2},
+                                GameState(), {})
+    df = model_input([features])
+    assert list(df.columns) == FEATURES
+    assert df.in_check.dtype == int and df.in_book.dtype == int
+    assert list(df.eco_family.cat.categories) == list("ABCDE")
+    assert df.eco_family.isna().all()  # empty book: no family yet

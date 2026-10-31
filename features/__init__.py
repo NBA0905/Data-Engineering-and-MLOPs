@@ -5,6 +5,7 @@ no clock after the move.
 """
 
 import chess
+import pandas as pd
 
 from features.board import board_features
 from features.fen import fen_key
@@ -59,6 +60,18 @@ def is_scored(white_title: str | None, black_title: str | None, speed: str) -> b
         and black_title not in EXCLUDED_TITLES
         and speed not in EXCLUDED_SPEEDS
     )
+
+
+def model_input(rows: pd.DataFrame | list[dict]) -> pd.DataFrame:
+    """The `FEATURES` columns in the dtypes the model was trained on.
+
+    Booleans become 0/1 and `eco_family` a categorical over A-E, which
+    HistGradientBoosting treats as categorical. Training and the live consumer both call this.
+    """
+    df = pd.DataFrame(rows)[FEATURES].copy()
+    df[["in_check", "in_book"]] = df[["in_check", "in_book"]].astype(int)
+    df["eco_family"] = pd.Categorical(df["eco_family"], categories=list("ABCDE"))
+    return df
 
 
 def compute_features(
