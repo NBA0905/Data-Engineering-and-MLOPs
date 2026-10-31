@@ -14,7 +14,7 @@ import chess
 import chess.pgn
 import zstandard
 
-from features.clock import speed
+from features.clock import speed, time_spent
 from features.fen import fen_key
 
 # Centipawn clamp. Mate scores are mapped to the clamp so they do not distort the label.
@@ -141,7 +141,7 @@ def parse_game(text: str) -> list[dict]:
                     "clock_before": clock_before,
                     "clock_after": clock_after,
                     "opp_clock": clocks[not mover],
-                    "time_spent": max(0.0, clock_before - clock_after + inc),
+                    "time_spent": time_spent(clock_before, clock_after, inc),
                     "cp_before": float(cp_before),
                     "cp_after": float(cp_after),
                     "wp_before": wp_before,

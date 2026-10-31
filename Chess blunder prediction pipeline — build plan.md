@@ -110,11 +110,13 @@ A 300 centipawn drop while already winning a queen is not a blunder in any usefu
 
 The opening name is not a model feature, but the dashboard shows it.
 
-**Algorithm.** `HistGradientBoostingClassifier` from scikit-learn with class weights. Fast, handles mixed features without scaling, good enough for this assignment.
+Phase 2b added engine-free threat features (pieces attacked, en prise, pinned, king zone, captures and checks available, what the mover could win) and game-history features (recent material change, material below the best point, recent time use). See phase 2b.
+
+**Algorithm.** `HistGradientBoostingClassifier` from scikit-learn. Fast, handles mixed features without scaling, good enough for this assignment. Phase 2 tested class weights and dropped them: same PR-AUC, badly calibrated probabilities.
 
 **Evaluation.** Blunders are a few percent of moves, so accuracy is meaningless here. Report PR-AUC and calibration. Two baselines to beat: the base rate, and a model using clock remaining alone.
 
-**Retraining and promotion.** Every DAG run logs parameters, metrics and the model to MLflow and registers a new version. The split is by time: the newest replayed batch is the test set and is never trained on in that run. The new version and the current `champion` are both scored on that same batch. If the new version has the higher PR-AUC, the `champion` alias moves to it. The live consumer always loads `models:/blunder@champion`.
+**Retraining and promotion.** Every DAG run logs parameters, metrics and the model to MLflow and registers a new version under the `challenger` alias. The split is by time: the newest replayed batch is the test set and is never trained on in that run. The new version and the current `champion` are both scored on that same batch. If the new version has the higher PR-AUC, the `champion` alias moves to it. The live consumer always loads `models:/blunder@champion`.
 
 **Replay and retraining schedule.** Proposed defaults, all configurable as Airflow params:
 
@@ -214,11 +216,64 @@ First look at the signal: blunder rate is 8.6% with under 10 seconds on the cloc
 - Train `HistGradientBoostingClassifier` with class weights. Compare to the base rate and the clock-only baseline. Report PR-AUC and calibration.
 - Done when: the model clearly beats the clock-only baseline.
 
+**Status (Oct 30): done, go.** `ingest/build_features.py` replays every parsed game through `compute_features` (3.87M rows, about 2 minutes on 8 workers, `data/parquet/features/`), and `notebooks/blunder_model.ipynb` trains and evaluates. Test set: the newest 11,854 games (last 6 of 30 parts), 760k moves.
+
+| Model | PR-AUC | ROC-AUC | Brier |
+| --- | --- | --- | --- |
+| Base rate | 0.069 | 0.500 | 0.064 |
+| Clock only | 0.086 | 0.591 | 0.064 |
+| All 15 features | **0.156** | 0.743 | 0.061 |
+| All 15, class-weighted | 0.157 | 0.744 | 0.212 |
+
+- The model beats clock only by 1.8× in PR-AUC, and by at least 1.78× in every speed. Flagging the riskiest 5% of moves catches 15% of blunders at 20% precision (2.9× the base rate).
+- **Change from the plan: no class weights.** They don't improve PR-AUC and they ruin calibration (mean prediction 0.41 against a 6.9% blunder rate). The unweighted model is well calibrated, so the dashboard can show its probability directly.
+- Opening features are redundant with move number, piece count and legal moves: removing all three leaves PR-AUC unchanged. We keep them (the join, the dashboard). Named-only versus with interpolated positions makes no difference; we keep the interpolated ones.
+- Strongest features: material balance, mover rating, legal move count, plies out of book. More model capacity does not help (0.157 at most), so the ceiling is the feature set.
+- DAG settings for phase 4: `HistGradientBoostingClassifier(max_iter=500, early_stopping=True, random_state=0)`, no class weights, `features.FEATURES` (26 features after phase 2b).
+
+Interface agreed:
+
+- `features/board.py`: `board_features(board)`. Material balance (mover's view), piece count, in check, legal move count, move number. Needs python-chess, so the batch lane computes these in the parser, not in Spark.
+- `features/openings.py`: `book_features(fen_key, book)` gives `in_book` and the position's ECO letter.
+- `features/game.py`: `GameState`, the per-game state for the sequential features (`plies_out_of_book`, `eco_family` of the last book position, `prev_time_spent` per colour). The live consumer keeps one per game id; Spark computes the same values with window functions.
+- `features/__init__.py`: `compute_features(board, clocks, meta, state, book)`, the ordered `FEATURES` list (the training/serving contract), `BLUNDER_THRESHOLD = 0.15` and `is_scored()` (drops bot and UltraBullet games).
+- Conventions: plies count positions (start = 0, python-chess `board.ply()`); the starting position counts as book; missing values stay `None` (HistGradientBoosting handles NaN natively); `time_spent` uses one shared formula `clock_before - clock_after + inc`.
+- Only information available before the move is used: no evals, no clock after the move.
+
+### Phase 2b — Threat and game-history features (A)
+
+Phase 2 showed the feature set was the ceiling, so we added two groups of engine-free features. Both lanes get them through the shared module.
+
+- **Threats** (in `board_features`): own pieces attacked; en prise (attacked and undefended, or attacked by a cheaper piece), their count and the value of the most valuable one; the same value for the opponent's pieces (what the mover could win); pinned pieces; attacked squares around the king; captures and checks available. A proxy for "the right move is hard to find".
+- **History** (in `GameState`): material change over the last 4 plies, material below the mover's best point in the game, average time over the mover's last 3 moves. A proxy for "has the game already gone wrong". Earlier blunders themselves can't be used: the live lane has no evals to detect them.
+
+**Status (Oct 30): done.** The feature table now takes about 6 minutes to build (the check and capture scan over every legal move is the slow part).
+
+| Features | PR-AUC | ROC-AUC |
+| --- | --- | --- |
+| Phase 2 (15) | 0.156 | 0.743 |
+| + threats (23) | 0.174 | 0.766 |
+| + history (18) | 0.157 | 0.745 |
+| All 26 | **0.177** | 0.769 |
+
+- Threats give +12% PR-AUC. The strongest new feature is `opp_en_prise_value`: missing a chance to win material is also a win-probability drop. History adds almost nothing, because material balance already carries most of it. We keep both groups.
+- Overall, 2.1× the clock-only baseline (at least 2.0× in every speed). Flagging the riskiest 5% of moves catches 17% of blunders at 23% precision (3.3× the base rate). Calibration still holds without class weights.
+- For phase 5: the history features are Spark windows too: `lag` over 4 plies for material change, a running max for the drawdown, and a 3-row window over the mover's own moves for the time average.
+
 ### Phase 3 — Redpanda and the TV producer (B, in parallel with 1–2)
 
 - Redpanda (dev-container mode) and Redpanda Console in Docker Compose.
 - Producer with one connection per channel. Holds game metadata from each `featured` event in memory and stamps every move event with it. Handles game switches.
 - Publishes to `tv.moves`, keyed by game id.
+
+**Status (Oct 31): done.** Redpanda v25.1.1 (`--mode dev-container --smp 1`, Kafka on `localhost:19092`) and Console (`localhost:8085`) in `docker-compose.yml`. `ingest/tv_producer.py` runs one thread per channel (`uv run python -m ingest.tv_producer rapid blitz`). On each `featured` event it fetches the game once from `/game/export/{id}` for the time control and the moves so far, sends a `start` message, then stamps every `move` message with the game metadata. A 45 second run on rapid and blitz put 18 messages on `tv.moves` (1 partition, auto-created). Tests in `tests/test_tv_producer.py`.
+
+Gaps found in the check, to fix before phase 6:
+
+- The producer drops `user.title` from the `featured` players, but `is_scored()` needs both titles to skip bot games.
+- It also drops the players' `seconds` from the `featured` event, so the consumer has no clock for the first move after joining a game.
+- `moves_so_far` lags the live position: Lichess delays exports of ongoing games, and both captured games replayed to ply 50 while the start FEN was at ply 53. The consumer must trust the FEN and accept a small gap in the history features when it joins mid-game.
+- No delivery callback, so failed sends go unnoticed. Redpanda runs without `--memory 1G`.
 
 ### Phase 4 — Storage, tracking and orchestration (A)
 
@@ -226,6 +281,17 @@ First look at the signal: blunder rate is 8.6% with under 10 seconds on the cloc
 - Archive replay producer: reads the next N annotated games from the `.pgn.zst`, publishes them to `games.archive`, saves the offset in a Postgres checkpoint table. Resumes from the checkpoint on the next run.
 - A consumer task writes `games.archive` to `bronze/archive/` on RustFS.
 - DAG `train_blunder_model` (every 6 hours, see the replay and retraining schedule): replay next batch → land in bronze → Spark features → train → evaluate on newest batch → register → promote `champion` if better.
+
+**Status (Oct 31): storage, tracking and training done; Airflow, replay and DAG still to do.**
+
+- Compose (B) adds RustFS (S3 API on `localhost:9000`, console on `9001`), Postgres 16 (databases `airflow`, `mlflow`, `chess`; `docker/postgres-init.sql` only runs when the volume is first created), pgAdmin (`localhost:5050`) and MLflow 3.17.2 (`localhost:5000`, Postgres backend, artifacts in the `mlflow` bucket, same version as `uv.lock`). `storage/create_buckets.py` creates `bronze`, `silver`, `gold` and `mlflow`; `storage/check_setup.py` checks MLflow logs to Postgres and RustFS.
+- `training/train_model.py` trains with the phase 2 settings on the feature table, holds out the newest 6 parts, logs parameters, metrics (incl. the clock-only baseline and the lift over it) and the feature list as the `features` tag, registers the version and gives it the `challenger` alias.
+- `training/evaluate_model.py` scores `@challenger` and `@champion` on the same held-out parts, logs the comparison as its own run (`evaluate v<n>`, tag `promoted`), moves `champion` if the challenger's PR-AUC is strictly higher (or there is no champion yet), and removes the `challenger` alias. These become the train and evaluate tasks of the DAG. The `champion` alias can still be moved by hand in the MLflow UI, for a rollback or the demo.
+- **`blunder` v1 is champion**: PR-AUC 0.177, ROC-AUC 0.769, clock only 0.086 (2.1×), mean prediction 6.9% against a 7.1% blunder rate, the same as the notebook. A retrain with the same data gave an identical v2 (`random_state=0`), which the evaluation correctly did not promote on the tie.
+- `features.model_input(rows)` turns feature dicts into the dtypes the model was trained on (booleans as 0/1, `eco_family` as a categorical over A–E). Training and the consumer both call it; scoring one dict at a time gives exactly the same probabilities as scoring a DataFrame.
+- **MLflow artifacts from the host.** The server tells clients to download artifacts straight from RustFS via presigned links to `http://rustfs:9000`, a name that only resolves inside the Docker network. From Windows every model load stalled on retries. `storage.tracking.connect()` sets the tracking URI and switches the client to download and upload through the MLflow server; loading the champion now takes about 3 seconds. Every script that talks to MLflow from the host calls it; containers on `chess_network` don't need it.
+- **Model serialisation.** MLflow 3.17 saves sklearn models with skops and refuses types that are not on its allow list. `SKOPS_TRUSTED` in `train_model.py` lists the three HistGradientBoosting internals it flagged. We keep skops rather than switching to cloudpickle, which would run arbitrary code on load.
+- Still to do: Airflow (`LocalExecutor`) in Compose, the archive replay producer with its checkpoint table, landing `games.archive` in `bronze/archive/`, uploading the opening book to `bronze/eco/` and `gold/openings/`, and the `train_blunder_model` DAG.
 
 ### Phase 5 — Spark job (A)
 
@@ -240,6 +306,12 @@ First look at the signal: blunder rate is 8.6% with under 10 seconds on the cloc
 - Keep small per-game state (previous clock, last in-book ply) and reset it on a `featured` game switch.
 - Write raw events to `bronze/tv/` on RustFS.
 - Test that a known position produces identical feature vectors through the Spark path and the consumer path.
+
+Ready from phase 4 (Oct 31): the champion is registered, so the consumer can be built against it now.
+
+- Call `storage.tracking.connect()` before any MLflow call when running on the host, load the model with `mlflow.sklearn.load_model("models:/blunder@champion")`, and score with `model.predict_proba(model_input([features]))[0, 1]`.
+- Check at startup that the champion run's `features` tag equals `features.FEATURES`.
+- Handle the producer gaps listed under phase 3 (titles, starting clocks, the lag in `moves_so_far`).
 
 ### Phase 7 — Opening book lookup (B)
 
@@ -316,6 +388,6 @@ Open questions to settle between us:
 - [x] Do we include `eco_interpolated.json` (gap-filling positions) or only the named openings in `ecoA` … `ecoE`? Yes, flagged with `is_interpolated` so phase 2 can compare
 - [x] Which month of the archive? September 2026, first 3 GB (SHA-256 in the README)
 - [ ] Which month of the archive do we use, and do we both work from the same slice?
-- [ ] Blunder threshold — what win-probability drop counts?
-- [ ] Do we exclude bot games and unrated players?
+- [x] Blunder threshold — what win-probability drop counts? 0.15 (`BLUNDER_THRESHOLD` in `features/`)
+- [x] Do we exclude bot games and unrated players? Bots out (194 of 59,894 games, blunder rate 4.3% vs 6.9%), in training and live. Unrated is moot for training: the archive file holds rated games only. Live, casual games are scored. UltraBullet is excluded too (171 games, no TV channel)
 - [ ] Which channel does the dashboard default to? Rapid or classical will look more responsive than bullet, given Streamlit's polling refresh.
