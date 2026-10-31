@@ -26,3 +26,4 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning:pyspark.*", "ignore:The copy keyword is deprecated"]

@@ -35,6 +35,7 @@ x-airflow-common:
     RUSTFS_ENDPOINT: http://rustfs:9000
     MLFLOW_TRACKING_URI: http://mlflow:5000
     CHESS_DB_URL: postgresql://airflow:airflow@postgres:5432/chess
+    SPARK_REMOTE: sc://spark-connect:15002
   volumes:
     - ./dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
@@ -157,6 +158,7 @@ services:
       context: .
       dockerfile: docker/mlflow.Dockerfile
     container_name: mlflow
+    init: true
     environment:
       MLFLOW_S3_ENDPOINT_URL: http://rustfs:9000
       AWS_ACCESS_KEY_ID: rustfsadmin
@@ -284,6 +286,7 @@ services:
   spark-connect:
     image: apache/spark:4.1.1
     container_name: spark-connect
+    init: true
     # root so it can write the downloaded connector jars to the ivy volume (dev setup only)
     user: root
     environment:
