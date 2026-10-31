@@ -29,30 +29,48 @@ def win_probability(cp: float) -> float:
     return 1 / (1 + math.exp(-0.00368208 * cp))
 
 
-def iter_game_texts(path: Path) -> Iterator[str]:
-    """Yield the raw PGN text of each game in a .pgn.zst file.
+def iter_games(path: Path, start: int = 0) -> Iterator[tuple[str, int]]:
+    """Yield (PGN text, end offset) for each game in a .pgn.zst file.
+
+    Offsets count bytes of the decompressed stream. A game's end offset is where the next
+    game starts, so it can be stored as a checkpoint and passed back as `start` to resume
+    there (the stream is decompressed up to `start` and thrown away, which is fast).
 
     The file may be cut off (we download only the first 3 GB): decoding stops at the
     first error and the incomplete last game is dropped.
     """
-    buf: list[str] = []
+    buf: list[bytes] = []
+    offset = start
     with path.open("rb") as fh:
         reader = zstandard.ZstdDecompressor().stream_reader(fh)
-        lines = io.TextIOWrapper(reader, encoding="utf-8")
         try:
-            for line in lines:
-                if line.startswith("[Event ") and buf:
-                    yield "".join(buf)
+            reader.seek(start)
+            for line in io.BufferedReader(reader, 1 << 20):
+                if line.startswith(b"[Event ") and buf:
+                    yield b"".join(buf).decode("utf-8"), offset
                     buf = []
                 buf.append(line)
+                offset += len(line)
         except (zstandard.ZstdError, UnicodeDecodeError):
             return
     if buf:
-        yield "".join(buf)
+        yield b"".join(buf).decode("utf-8"), offset
+
+
+def iter_game_texts(path: Path) -> Iterator[str]:
+    """Yield the raw PGN text of each game in a .pgn.zst file."""
+    for text, _ in iter_games(path):
+        yield text
 
 
 def has_evals(text: str) -> bool:
     return "[%eval" in text
+
+
+def game_id(text: str) -> str:
+    """The Lichess game id from the Site header, without parsing the game."""
+    start = text.find('[Site "') + len('[Site "')
+    return text[start : text.find('"', start)].rsplit("/", 1)[-1]
 
 
 def _elo(value: str | None) -> int | None:

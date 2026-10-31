@@ -136,3 +136,26 @@ uv run python -m ingest.build_features --no-interpolated --out data\parquet\feat
 ```
 
 Each takes about 6 minutes and writes 3.87M rows with 26 features. Then open `notebooks/blunder_model.ipynb` with `uv run jupyter lab` and run all cells (a few minutes).
+
+## Training DAG (archive replay → bronze → features → train → evaluate)
+
+The batch lane runs in Airflow as the `train_blunder_model` DAG, every 6 hours. Run the `opening_book` DAG once first: the features step needs `gold/openings/`.
+
+| Task | Script | What it does |
+| --- | --- | --- |
+| `replay_archive` | `ingest.replay_archive` | Sends the next annotated games from the archive to the `games.archive` topic and saves the position in the `archive_checkpoint` table (Postgres, database `chess`). The first run sends 20,000 games, every run after that 5,000. |
+| `land_in_bronze` | `ingest.land_archive` | Writes every message on `games.archive` the `bronze-archive` consumer group has not landed yet to `bronze/archive/` as Parquet, then commits the offsets. |
+| `build_features` | `ingest.build_gold_features` | Parses new bronze files into `silver/moves/` and builds their features into `gold/features/`. Stand-in for the Spark job (phase 5). |
+| `train_model` | `training.train_model` | Trains on `s3://gold/features`, newest 3 parts (6,000 games) held out, 27 parts before them as the training window, registers the `challenger`. |
+| `evaluate_model` | `training.evaluate_model` | Scores challenger and champion on the same 3 parts, promotes the better one. |
+
+Batch sizes, test parts and training window are DAG params, so a manual trigger can use a small batch for the demo. Each task runs the same command you can run by hand, for example:
+
+```powershell
+uv run python -m ingest.replay_archive data\raw\lichess_db_standard_rated_2026-09.part.pgn.zst --games 1000
+uv run python -m ingest.land_archive
+uv run python -m ingest.build_gold_features
+uv run python -m training.train_model --features s3://gold/features --test-parts 3 --train-parts 27
+```
+
+To replay the archive from the start again, delete its row from `archive_checkpoint` (pgAdmin, database `chess`).

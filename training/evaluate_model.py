@@ -9,7 +9,6 @@ Either way the `challenger` alias is removed, and the comparison is logged as it
 """
 
 import argparse
-from pathlib import Path
 
 import mlflow
 from mlflow import MlflowClient
@@ -18,7 +17,7 @@ from mlflow.exceptions import MlflowException
 from features import model_input
 from storage.tracking import TRACKING_URI, connect
 from training.train_model import (CHALLENGER, CHAMPION, EXPERIMENT, FEATURES_PATH, MODEL_NAME, TEST_PARTS,
-                                  load, metrics, split)
+                                  load, metrics)
 
 
 def version_for(client: MlflowClient, alias: str):
@@ -29,12 +28,12 @@ def version_for(client: MlflowClient, alias: str):
         return None
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--features", type=Path, default=FEATURES_PATH)
+    parser.add_argument("--features", default=FEATURES_PATH, help="local folder or s3://bucket/folder on RustFS")
     parser.add_argument("--test-parts", type=int, default=TEST_PARTS, help="newest parts to compare on")
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     connect(args.tracking_uri)
     client = MlflowClient(args.tracking_uri)
@@ -42,7 +41,7 @@ def main() -> None:
     if challenger is None:
         raise SystemExit(f"no {CHALLENGER} to evaluate: run training.train_model first")
 
-    _, test = split(load(args.features), args.test_parts)
+    test = load(args.features, args.test_parts)  # the same newest parts train_model held out
     X_test = model_input(test)
     scores = {}
     for alias, version in [(CHALLENGER, challenger), (CHAMPION, champion)]:

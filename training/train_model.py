@@ -1,6 +1,7 @@
 """Train the blunder model, log it to MLflow and register it as the `challenger`.
 
     uv run python -m training.train_model
+    uv run python -m training.train_model --features s3://gold/features --test-parts 3 --train-parts 27
 
 Same setup as the notebook: bots and UltraBullet dropped, the newest parts held out as the
 test set, `HistGradientBoostingClassifier` without class weights on `features.FEATURES`.
@@ -9,7 +10,6 @@ it replaces the `champion`, which is what the live consumer loads.
 """
 
 import argparse
-from pathlib import Path
 
 import mlflow
 import numpy as np
@@ -20,13 +20,14 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 
 from features import BLUNDER_THRESHOLD, FEATURES, is_scored, model_input
+from storage.rustfs import resolve
 from storage.tracking import TRACKING_URI, connect
 
 MODEL_NAME = "blunder"
 CHAMPION = "champion"
 CHALLENGER = "challenger"
 EXPERIMENT = "blunder-model"
-FEATURES_PATH = Path("data/parquet/features")
+FEATURES_PATH = "data/parquet/features"  # or s3://gold/features on RustFS
 TEST_PARTS = 6
 PARAMS = dict(max_iter=500, early_stopping=True, random_state=0)
 # MLflow saves sklearn models with skops, which only loads types on an allow list. These are
@@ -38,9 +39,15 @@ SKOPS_TRUSTED = [
 ]
 
 
-def load(path: Path) -> pd.DataFrame:
-    """Scored moves with the label, one row per move."""
-    df = pd.read_parquet(path, columns=["game_id", "part", "speed", "white_title", "black_title", "wp_drop", *FEATURES])
+def load(path: str, newest_parts: int | None = None) -> pd.DataFrame:
+    """Scored moves with the label, one row per move, from the newest `newest_parts` parts (default all)."""
+    lake, path = resolve(path)
+    filters = None
+    if newest_parts is not None:
+        last = pd.read_parquet(path, columns=["part"], filesystem=lake).part.max()
+        filters = [("part", ">", last - newest_parts)]
+    df = pd.read_parquet(path, columns=["game_id", "part", "speed", "white_title", "black_title", "wp_drop", *FEATURES],
+                         filters=filters, filesystem=lake)
     keep = np.array([is_scored(w, b, s) for w, b, s in zip(df.white_title, df.black_title, df.speed)])
     df = df[keep].reset_index(drop=True)
     df["blunder"] = df.wp_drop >= BLUNDER_THRESHOLD
@@ -50,6 +57,8 @@ def load(path: Path) -> pd.DataFrame:
 def split(df: pd.DataFrame, test_parts: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Train on the older parts, test on the newest `test_parts` (parts are in archive order)."""
     first_test = df.part.max() + 1 - test_parts
+    if first_test <= df.part.min():
+        raise SystemExit(f"only {df.part.nunique()} parts, need more than --test-parts {test_parts} to train on")
     return df[df.part < first_test], df[df.part >= first_test]
 
 
@@ -58,14 +67,16 @@ def metrics(y: pd.Series, p: np.ndarray) -> dict:
             "brier": brier_score_loss(y, p), "mean_p": float(p.mean())}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--features", type=Path, default=FEATURES_PATH)
+    parser.add_argument("--features", default=FEATURES_PATH, help="local folder or s3://bucket/folder on RustFS")
     parser.add_argument("--test-parts", type=int, default=TEST_PARTS, help="newest parts held out as test set")
+    parser.add_argument("--train-parts", type=int, help="parts before the test set to train on (default all)")
     parser.add_argument("--tracking-uri", default=TRACKING_URI)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    train, test = split(load(args.features), args.test_parts)
+    window = None if args.train_parts is None else args.train_parts + args.test_parts
+    train, test = split(load(args.features, window), args.test_parts)
     X_train, X_test = model_input(train), model_input(test)
     print(f"train {len(train):,} moves, test {len(test):,} moves ({test.game_id.nunique():,} games)")
 
@@ -80,6 +91,7 @@ def main() -> None:
 
         mlflow.log_params({**PARAMS, "class_weight": None, "blunder_threshold": BLUNDER_THRESHOLD,
                            "n_features": len(FEATURES), "test_parts": args.test_parts,
+                           "train_parts": train.part.nunique(), "features_path": args.features,
                            "train_moves": len(train), "test_moves": len(test), "n_iter": model.n_iter_})
         mlflow.log_metrics({f"test_{k}": v for k, v in test_metrics.items()})
         mlflow.log_metrics({"test_base_rate": test.blunder.mean(), "test_clock_only_pr_auc": clock_pr_auc,
