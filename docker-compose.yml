@@ -8,6 +8,7 @@ volumes:
   redpanda-0: null
   rustfs-data: null
   postgres-db-volume: null
+  spark-ivy: null
 
 x-live-common:
   &live-common
@@ -51,6 +52,7 @@ x-airflow-common:
     RUSTFS_ENDPOINT: http://rustfs:9000
     MLFLOW_TRACKING_URI: http://mlflow:5000
     CHESS_DB_URL: postgresql://airflow:airflow@postgres:5432/chess
+    SPARK_REMOTE: sc://spark-connect:15002
   volumes:
     - ./dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
@@ -174,6 +176,7 @@ services:
       context: .
       dockerfile: docker/mlflow.Dockerfile
     container_name: mlflow
+    init: true
     environment:
       MLFLOW_S3_ENDPOINT_URL: http://rustfs:9000
       AWS_ACCESS_KEY_ID: rustfsadmin
@@ -292,4 +295,66 @@ services:
     stop_grace_period: 30s
     depends_on:
       - redpanda-0
+      - rustfs
+  spark-master:
+    image: apache/spark:4.1.1
+    container_name: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8088"]
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    networks:
+      - chess_network
+    ports:
+      - 8088:8088  # spark master ui
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  spark-worker:
+    image: apache/spark:4.1.1
+    container_name: spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_WEBUI_PORT: 8089
+      SPARK_NO_DAEMONIZE: "true"
+    networks:
+      - chess_network
+    ports:
+      - 8089:8089  # spark worker ui
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  spark-connect:
+    image: apache/spark:4.1.1
+    container_name: spark-connect
+    init: true
+    # root so it can write the downloaded connector jars to the ivy volume (dev setup only)
+    user: root
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    command: >
+      /opt/spark/sbin/start-connect-server.sh
+      --master spark://spark-master:7077
+      --packages org.apache.hadoop:hadoop-aws:3.4.2
+      --conf spark.jars.ivy=/opt/ivy
+      --conf spark.hadoop.fs.s3a.endpoint=http://rustfs:9000
+      --conf spark.hadoop.fs.s3a.access.key=rustfsadmin
+      --conf spark.hadoop.fs.s3a.secret.key=rustfsadmin
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+    volumes:
+      - spark-ivy:/opt/ivy
+    networks:
+      - chess_network
+    ports:
+      - 4040:4040    # spark jobs ui
+      - 15002:15002  # spark connect, this is what our code talks to
+    depends_on:
+      - spark-master
+      - spark-worker
       - rustfs

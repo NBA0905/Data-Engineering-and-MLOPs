@@ -11,6 +11,7 @@ dependencies = [
     "pandas>=3.1.0",
     "psycopg2-binary>=2.9.13",
     "pyarrow>=25.0.1",
+    "pyspark-client==4.1.1",
     "requests>=2.34.2",
     "scikit-learn>=1.9.1",
     "zstandard>=0.25.0",
@@ -25,3 +26,4 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning:pyspark.*", "ignore:The copy keyword is deprecated"]
