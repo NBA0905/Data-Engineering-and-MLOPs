@@ -55,29 +55,9 @@ A blunder is a move that throws away a large part of the player's winning chance
 
 **What the TV feed does not send.** The feed has no game id on move events, no time control, and joins games halfway. Our producer therefore remembers the current game per channel from the `featured` event, stamps it on every move, and asks the Lichess export API **once per game** for the time control and the moves played so far.
 
-## 4. Architecture
+## 4. Each step and why we built it this way
 
-There are **two lanes that only meet in two places**: RustFS (data and the opening book) and MLflow (the registered model).
-
-- The **batch lane** replays history through Kafka into the lake, builds the feature table with Spark, trains a challenger and promotes it if it is better. Airflow schedules it; nothing in it is live.
-- The **live lane** reads the TV feed, computes the same features for the position on the board right now, asks the champion model for a probability and writes it to Postgres for the dashboard. It runs as long-lived Docker services, not as Airflow tasks.
-
-Everything runs in one `docker-compose.yml` on a laptop.
-
-| Service | Port | Role |
-|---|---|---|
-| Redpanda + Console | 19092 · 8085 | Kafka API · topic browser |
-| RustFS | 9000 · 9001 | S3 API · web console |
-| Postgres + pgAdmin | 5432 · 5050 | Airflow and MLflow metadata, replay checkpoint, predictions |
-| MLflow | 5000 | Tracking server and model registry |
-| Airflow (api-server, scheduler, dag-processor) | 8080 | Orchestration of the batch lane |
-| Spark master · worker · connect | 8088 · 8089 · 15002 (jobs UI 4040) | Spark cluster, used through Spark Connect |
-| tv-producer · live-scorer · tv-lander | – | Live lane |
-| Streamlit dashboard | 8501 | Dashboard |
-
-## 5. Each step and why we built it this way
-
-### 5.1 Ingestion with Kafka (Redpanda)
+### 4.1 Ingestion with Kafka (Redpanda)
 
 **What.** Two topics:
 
@@ -92,7 +72,7 @@ Everything runs in one `docker-compose.yml` on a laptop.
 
 **Retention.** Kafka is a buffer, not storage: `tv.moves` keeps messages for 24 hours. Long-term data lives in RustFS (raw live events in `bronze/tv/`).
 
-### 5.2 The archive replay: "always send the next new data"
+### 4.2 The archive replay: "always send the next new data"
 
 The assignment requires a simulation program that sends data to Kafka and continues where it stopped. Our **archive replay producer** (`ingest/replay_archive.py`) reads the next batch of annotated games from the archive file and publishes them to `games.archive`.
 
@@ -102,7 +82,7 @@ The assignment requires a simulation program that sends data to Kafka and contin
 
 Because each run adds new games, the periodic retraining actually sees new data.
 
-### 5.3 Landing in the lake (RustFS)
+### 4.3 Landing in the lake (RustFS)
 
 **What.** RustFS is an S3-compatible object store, our data lake, organised in layers:
 
@@ -119,13 +99,13 @@ Because each run adds new games, the periodic retraining actually sees new data.
 
 **Why Parquet.** Columnar and compressed: 3.9 million parsed moves take 210 MB, and readers fetch only the columns they need, which is what the training script and the dashboard do. It also stores column types, unlike CSV.
 
-### 5.4 Parsing and board features (Python, before Spark)
+### 4.4 Parsing and board features (Python, before Spark)
 
 `ingest/parse_bronze.py` turns each landed game into one row per move: ratings, time control, clocks, the engine evaluation before and after, the label, and **13 board features** computed with python-chess (material balance, legal moves, pieces attacked, pieces en prise, pinned pieces, attacks around the king, captures and checks available, and more).
 
 **Why this is not in Spark.** These features need python-chess position by position. Running that row by row inside Spark would mean Python UDFs serialising tens of millions of positions, which is very slow, and it would require python-chess on the Spark workers. So Python does the parsing (with a few processes, in chunks of 2,000 games to keep memory flat), and Spark does the columnar work it is good at. Only files that have no moves file yet are parsed.
 
-### 5.5 Cleaning and combining with Spark
+### 4.5 Cleaning and combining with Spark
 
 **What.** `spark/build_features.py`, run from Airflow through **Spark Connect** against a standalone cluster (master, worker, connect server), reads `bronze/moves/` and `gold/openings/`:
 
@@ -152,7 +132,7 @@ Because each run adds new games, the periodic retraining actually sees new data.
 
 **Result on our data:** 29,683 games and 1.93 million moves in silver and gold, built in 1 minute 45 seconds.
 
-### 5.6 Orchestration with Airflow
+### 4.6 Orchestration with Airflow
 
 **DAG `train_blunder_model`** (every 6 hours, `catchup=False`, `max_active_runs=1`):
 
@@ -170,7 +150,7 @@ replay_archive → land_in_bronze → parse_moves → spark_features → train_m
 - **Every six hours with `catchup=False`.** Our laptops are not on day and night; this gives two or three retrains per working day without a storm of catch-up runs after the laptop was off. Parameters (`games`, `backfill`, `test_parts`, `train_parts`) can be changed when triggering by hand.
 - **LocalExecutor instead of Celery.** One machine, so no Redis or worker containers are needed. It saves memory and is a standard Airflow setting. Airflow shares the Postgres server with MLflow and the predictions.
 
-### 5.7 Training, tracking and the model registry (MLflow)
+### 4.7 Training, tracking and the model registry (MLflow)
 
 **Model.** `HistGradientBoostingClassifier` from scikit-learn on **26 engine-free features**: rating and rating gap, time control and increment, both clocks, time spent on the previous move, move number, material and piece count, check, legal moves, the three opening-book features, eight threat features and three game-history features. Gradient boosting handles mixed features and missing values (for example no previous move yet) without scaling. In the notebook, class weights did not improve PR-AUC and badly hurt calibration, so we train without them: the probabilities can be shown as they are.
 
@@ -188,7 +168,7 @@ The exploratory notebook (60,000 games, test set of 11,854 games) found the same
 
 **Registry and promotion.** Each training run registers a new version of model `blunder` with the alias **`challenger`**. `evaluate_model` then scores the challenger and the current **`champion`** on the **same** newest test games and moves the `champion` alias only if the challenger's PR-AUC is higher. The comparison is logged as its own run. The live scorer always loads `models:/blunder@champion`, so a better model reaches production without any manual step.
 
-### 5.8 The live lane: scoring the TV feed
+### 4.8 The live lane: scoring the TV feed
 
 - **`tv-producer`** opens one streaming connection per channel (bullet, blitz, rapid, classical) in its own thread, stamps the current game on every move, adds the time control from one export call per game, and publishes to `tv.moves`. It reconnects automatically if Lichess drops the connection.
 - **`live-scorer`** reads `tv.moves`, keeps one `GameState` per game (reset when a new game starts on a channel), builds the board from the FEN in each message, computes the 26 features with the **same `features` module** used for training, and asks the champion model for the probability that the player to move blunders. Each prediction is written to the `predictions` table in Postgres.
@@ -198,7 +178,7 @@ The exploratory notebook (60,000 games, test set of 11,854 games) found the same
 
 **Edge cases handled.** Move events carry no game id (the producer stamps it). Games switch without warning (the `featured` event resets the state, and the dashboard always follows the newest game per channel). The export API can be one move ahead of the feed (the scorer trusts the FEN in the message). Lichess TV writes castling as king-takes-rook (`e1h1`), another reason to build the board from the FEN.
 
-### 5.9 The dashboard (Streamlit)
+### 4.9 The dashboard (Streamlit)
 
 Three pages:
 
@@ -206,7 +186,7 @@ Three pages:
 - **Data.** Blunder rate by time left on the clock, by moves since leaving the opening book, by speed and by rating, read from `gold/features` in RustFS (cached for ten minutes, only the needed columns).
 - **Model.** The current champion, its PR-AUC next to both baselines, PR-AUC across every retrain, and a table of all finished training runs, read from MLflow.
 
-## 6. Quality and robustness
+## 5. Quality and robustness
 
 | Measure | Where |
 |---|---|
@@ -221,7 +201,7 @@ Three pages:
 
 Besides the required tools, the pipeline also includes the MLflow model registry with automatic promotion, several Airflow operator types (TaskFlow tasks, the bash decorator, typed `Param`s), Spark Connect on a standalone cluster, and a combination of three data sources: a live stream, a replayed archive and an external reference set.
 
-## 7. Limitations and next steps
+## 6. Limitations and next steps
 
 - **Spark reprocesses all of bronze on every run.** Simple and always correct, and fast enough now (under two minutes for 30,000 games), but it grows with the data. The next step is to process only new batches and append to silver and gold.
 - **No live accuracy check.** We cannot know live whether a predicted risk turned into a blunder, because that needs an engine. A low-frequency DAG could fetch Lichess's analysis of finished TV games afterwards and compare it with the live predictions.
@@ -229,7 +209,7 @@ Besides the required tools, the pipeline also includes the MLflow model registry
 - **One laptop.** Fourteen containers fit, but only just. We bring services up in stages while developing, keep the DAG paused unless we need runs, and run Spark with dynamic allocation.
 - **Training/serving versions.** The model is trained inside the Airflow image; the live image must use the same scikit-learn version to load it. A shared base image would remove that risk.
 
-## 8. Running it
+## 7. Running it
 
 ```powershell
 uv sync
