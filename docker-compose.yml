@@ -1,0 +1,374 @@
+name: chess-blunder
+
+networks:
+  chess_network:
+    driver: bridge
+
+volumes:
+  redpanda-0: null
+  rustfs-data: null
+  postgres-db-volume: null
+  spark-ivy: null
+
+x-live-common:
+  &live-common
+  build:
+    context: .
+    dockerfile: docker/live.Dockerfile
+  image: chess-blunder-live
+  environment:
+    KAFKA_BOOTSTRAP: redpanda-0:9092
+    RUSTFS_ENDPOINT: http://rustfs:9000
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    CHESS_DB_URL: postgresql://airflow:airflow@postgres:5432/chess
+  volumes:
+    - .:/app
+  networks:
+    - chess_network
+  restart: unless-stopped
+
+x-airflow-common:
+  &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow.Dockerfile
+  image: chess-blunder-airflow
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: 8WRo8FHzMjgXwN0_aMZ3JIM-XLTgJwlaIa7LSYikP9w=
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: airflow_jwt_secret
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+    # our own settings, the project code reads these
+    PYTHONPATH: /opt/airflow/project
+    KAFKA_BOOTSTRAP: redpanda-0:9092
+    RUSTFS_ENDPOINT: http://rustfs:9000
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    CHESS_DB_URL: postgresql://airflow:airflow@postgres:5432/chess
+    SPARK_REMOTE: sc://spark-connect:15002
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/config:/opt/airflow/config
+    - ./airflow/plugins:/opt/airflow/plugins
+    - .:/opt/airflow/project
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - chess_network
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  redpanda-0:
+    image: docker.redpanda.com/redpandadata/redpanda:v25.1.1
+    container_name: redpanda-0
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda-0:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda-0:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda-0:33145
+      - --advertise-rpc-addr redpanda-0:33145
+      - --mode dev-container
+      - --smp 1
+      - --memory 1G
+      - --default-log-level=info
+    volumes:
+      - redpanda-0:/var/lib/redpanda/data
+    networks:
+      - chess_network
+    ports:
+      - 18081:18081
+      - 18082:18082
+      - 19092:19092
+      - 19644:9644
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:v3.0.0
+    container_name: redpanda-console
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda-0:9092"]
+        schemaRegistry:
+          enabled: true
+          urls: ["http://redpanda-0:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda-0:9644"]
+    networks:
+      - chess_network
+    ports:
+      - 8085:8080
+    depends_on:
+      - redpanda-0
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+    volumes:
+      - rustfs-data:/data
+    networks:
+      - chess_network
+    ports:
+      - 9000:9000
+      - 9001:9001
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - chess_network
+    ports:
+      - 5432:5432
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  pgadmin:
+    image: dpage/pgadmin4:9.8
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: demo@example.com
+      PGADMIN_DEFAULT_PASSWORD: secret
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+    networks:
+      - chess_network
+    ports:
+      - 5050:80
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow.Dockerfile
+    container_name: mlflow
+    init: true
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://rustfs:9000
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --workers 1
+      --backend-store-uri postgresql+psycopg2://airflow:airflow@postgres:5432/mlflow
+      --artifacts-destination s3://mlflow
+      --allowed-hosts localhost:*,127.0.0.1:*,mlflow:*
+    networks:
+      - chess_network
+    ports:
+      - 5000:5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - 8080:8080
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins /opt/airflow/config
+        /entrypoint airflow version
+        /entrypoint airflow config list > /dev/null
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs /opt/airflow/plugins /opt/airflow/config
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+    user: "0:0"
+
+  # the live lane: long-running services, not airflow tasks
+  tv-producer:
+    <<: *live-common
+    container_name: tv-producer
+    command: python -m ingest.tv_producer bullet blitz rapid classical
+    depends_on:
+      - redpanda-0
+
+  live-scorer:
+    <<: *live-common
+    container_name: live-scorer
+    command: python -m consumer.score_moves
+    depends_on:
+      redpanda-0:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+
+  tv-lander:
+    <<: *live-common
+    container_name: tv-lander
+    command: python -m consumer.land_tv
+    stop_grace_period: 30s
+    depends_on:
+      - redpanda-0
+      - rustfs
+  spark-master:
+    image: apache/spark:4.1.1
+    container_name: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8088"]
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    networks:
+      - chess_network
+    ports:
+      - 8088:8088  # spark master ui
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  spark-worker:
+    image: apache/spark:4.1.1
+    container_name: spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_WEBUI_PORT: 8089
+      SPARK_NO_DAEMONIZE: "true"
+    networks:
+      - chess_network
+    ports:
+      - 8089:8089  # spark worker ui
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  spark-connect:
+    image: apache/spark:4.1.1
+    container_name: spark-connect
+    init: true
+    # root so it can write the downloaded connector jars to the ivy volume (dev setup only)
+    user: root
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    # the connect server is the spark driver. the default 1g heap ran out when a client sent
+    # ~1,000 games of local data, and a jvm that ran out of memory keeps failing every request.
+    # so: more heap, and exit on out of memory so docker restarts it instead of leaving it broken.
+    # dynamic allocation: one executor with both worker cores, stopped after 15 s idle, so the
+    # worker's memory is free again by the time the training task loads its data. shuffle data is
+    # not kept longer either: every dag run is a new session and never reuses the previous one's
+    restart: unless-stopped
+    command: >
+      /opt/spark/sbin/start-connect-server.sh
+      --master spark://spark-master:7077
+      --conf spark.driver.memory=2g
+      --conf spark.driver.extraJavaOptions=-XX:+ExitOnOutOfMemoryError
+      --conf spark.executor.cores=2
+      --conf spark.dynamicAllocation.enabled=true
+      --conf spark.dynamicAllocation.shuffleTracking.enabled=true
+      --conf spark.dynamicAllocation.executorIdleTimeout=15s
+      --conf spark.dynamicAllocation.shuffleTracking.timeout=15s
+      --packages org.apache.hadoop:hadoop-aws:3.4.2
+      --conf spark.jars.ivy=/opt/ivy
+      --conf spark.hadoop.fs.s3a.endpoint=http://rustfs:9000
+      --conf spark.hadoop.fs.s3a.access.key=rustfsadmin
+      --conf spark.hadoop.fs.s3a.secret.key=rustfsadmin
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+    volumes:
+      - spark-ivy:/opt/ivy
+    networks:
+      - chess_network
+    ports:
+      - 4040:4040    # spark jobs ui
+      - 15002:15002  # spark connect, this is what our code talks to
+    depends_on:
+      - spark-master
+      - spark-worker
+      - rustfs

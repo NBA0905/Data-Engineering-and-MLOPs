@@ -1,0 +1,24 @@
+# Data: archives, parquet, samples are local only
+data/
+*.pgn
+*.pgn.zst
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Local tooling output
+mlruns/
+mlartifacts/
+logs/
+spark-warehouse/
+
+# Secrets
+.env
+
+# Airflow
+airflow/
