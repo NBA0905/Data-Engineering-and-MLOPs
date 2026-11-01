@@ -1,11 +1,8 @@
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 import zstandard
 
 from ingest.archive import game_id, iter_games
-from ingest.build_gold_features import PART_SIZE, _process
-from ingest.build_features import _init
+from ingest.parse_bronze import parse_games
 from ingest.replay_archive import Checkpoint, next_games
 from tests.test_archive import GAME
 
@@ -49,11 +46,10 @@ def test_next_games_continues_after_checkpoint(archive):
     assert nothing == []
 
 
-def test_process_stamps_batch_and_part(tmp_path):
-    book = tmp_path / "book.parquet"
-    pq.write_table(pa.table({"fen_key": ["x"], "eco_family": ["A"], "is_interpolated": [False]}), book)
-    _init(book, True)
-    moves, features = _process([{"pgn": GAME, "batch": 4, "seq": PART_SIZE + 5}])
-    assert len(moves) == len(features) == 6
-    assert {m["seq"] for m in moves} == {PART_SIZE + 5}
-    assert {(f["batch"], f["part"]) for f in features} == {(4, 1)}
+def test_parse_games_stamps_batch_and_seq():
+    # the parse step keeps each game's batch and seq, spark later turns seq into the part number
+    rows = parse_games([{"pgn": GAME, "batch": 4, "seq": 2005}])
+    assert len(rows) == 6
+    assert {(r["batch"], r["seq"]) for r in rows} == {(4, 2005)}
+    # and the board features are added to every move
+    assert "legal_moves" in rows[0] and "material_balance" in rows[0]
