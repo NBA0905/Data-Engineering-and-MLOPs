@@ -37,7 +37,7 @@ The monthly archive is the training corpus. Roughly 6% of games carry `[%eval ..
 
 A monthly file is about 29 GB, but over the whole project we replay roughly 220k annotated games (about 4% of a month). We therefore download only the first 3 GB with an HTTP range request (`curl.exe -r 0-3221225471`). A zstd stream can be decoded from the start of a cut-off file, so the parser simply stops at the last complete game.
 
-Measured on Oct 28: 10.7% of the first 50,000 games in the September 2026 file carry `[%eval`, higher than the 6% we assumed. Scanning cost per replayed batch is correspondingly lower.
+Measurements: 10.7% of the first 50,000 games in the September 2026 file carry `[%eval`, higher than the 6% we assumed. Scanning cost per replayed batch is correspondingly lower.
 
 The archive does not go straight to storage. An **archive replay producer** reads annotated games from the `.pgn.zst` file and publishes them to the `games.archive` topic in batches, so all game data is ingested through Redpanda. The producer stores its position (byte offset and game count) in a checkpoint table in Postgres and resumes from there on the next run, so every run sends the next new games, never the same ones again. Because the training set grows with every run, periodic retraining actually sees new data.
 
@@ -54,7 +54,7 @@ The lookup is small (about 12k rows), so we load it once into RustFS during the 
 
 &#91;embedded content: pipeline architecture · two lanes, ten components\]
 
-This is the part that makes the project click. There are two data paths, not one.
+There are 2 data paths for the project.
 
 The batch lane replays history through Redpanda into RustFS, builds a feature table with Spark, trains a model and registers it. Nothing about it is live. The live lane reads the TV feed, computes the same features for the position on the board right now, asks the registered model for a probability and records the answer.
 
@@ -82,7 +82,7 @@ Redpanda topics: `games.archive` (replayed archive games), `tv.moves` (live move
 | Postgres | Airflow metadata, MLflow backend, prediction log, replay checkpoint |
 | Streamlit | Dashboard, polling Postgres |
 
-Clarifications that matter.
+Some clarifications for later:
 
 **Redpanda is our Kafka.** It implements the Kafka API, so producers and consumers use standard Kafka client libraries (`confluent-kafka` or `kafka-python`) unchanged. We used it during the bachelor, it runs as a single binary without ZooKeeper or a JVM, and it needs much less memory than Apache Kafka, which matters on our laptops. Run it in dev-container mode (`--smp 1 --memory 1G`) and add Redpanda Console so we can show topics and messages during the demo.
 
@@ -195,7 +195,7 @@ Phases 1, 3 and 7 can start at the same time once setup is done. Phase 7 is smal
 - Clamp mate scores, convert eval to win probability, compute the drop.
 - Done when: about 60k games are in Parquet and the blunder rate looks plausible (a few percent).
 
-**Status (Oct 30): done.** `ingest/archive.py` (reader and parser, reused by the replay producer in phase 4) and `ingest/parse_archive.py` (CLI). Result: 60,000 annotated games out of 607,614 scanned, 3.87M move rows, 210 MB Parquet in `data/parquet/moves/`, 173 seconds on 8 workers. The first move of each game is skipped because Lichess does not annotate the starting position. Each row also carries `speed` (computed from the time control with Lichess's rule, so the live lane can compute it the same way) and `lichess_nag`, the `?!` / `?` / `??` mark Lichess's own analysis put on the move.
+**Status: done.** `ingest/archive.py` (reader and parser, reused by the replay producer in phase 4) and `ingest/parse_archive.py` (CLI). Result: 60,000 annotated games out of 607,614 scanned, 3.87M move rows, 210 MB Parquet in `data/parquet/moves/`, 173 seconds on 8 workers. The first move of each game is skipped because Lichess does not annotate the starting position. Each row also carries `speed` (computed from the time control with Lichess's rule, so the live lane can compute it the same way) and `lichess_nag`, the `?!` / `?` / `??` mark Lichess's own analysis put on the move.
 
 Choosing the blunder threshold, measured against Lichess's own `??` marks on the trial run (2,000 games):
 
@@ -216,7 +216,7 @@ First look at the signal: blunder rate is 8.6% with under 10 seconds on the cloc
 - Train `HistGradientBoostingClassifier` with class weights. Compare to the base rate and the clock-only baseline. Report PR-AUC and calibration.
 - Done when: the model clearly beats the clock-only baseline.
 
-**Status (Oct 30): done, go.** `ingest/build_features.py` replays every parsed game through `compute_features` (3.87M rows, about 2 minutes on 8 workers, `data/parquet/features/`), and `notebooks/blunder_model.ipynb` trains and evaluates. Test set: the newest 11,854 games (last 6 of 30 parts), 760k moves.
+**Status: done, go.** `ingest/build_features.py` replays every parsed game through `compute_features` (3.87M rows, about 2 minutes on 8 workers, `data/parquet/features/`), and `notebooks/blunder_model.ipynb` trains and evaluates. Test set: the newest 11,854 games (last 6 of 30 parts), 760k moves.
 
 | Model | PR-AUC | ROC-AUC | Brier |
 | --- | --- | --- | --- |
@@ -247,7 +247,7 @@ Phase 2 showed the feature set was the ceiling, so we added two groups of engine
 - **Threats** (in `board_features`): own pieces attacked; en prise (attacked and undefended, or attacked by a cheaper piece), their count and the value of the most valuable one; the same value for the opponent's pieces (what the mover could win); pinned pieces; attacked squares around the king; captures and checks available. A proxy for "the right move is hard to find".
 - **History** (in `GameState`): material change over the last 4 plies, material below the mover's best point in the game, average time over the mover's last 3 moves. A proxy for "has the game already gone wrong". Earlier blunders themselves can't be used: the live lane has no evals to detect them.
 
-**Status (Oct 30): done.** The feature table now takes about 6 minutes to build (the check and capture scan over every legal move is the slow part).
+**Status: done.** The feature table now takes about 6 minutes to build (the check and capture scan over every legal move is the slow part).
 
 | Features | PR-AUC | ROC-AUC |
 | --- | --- | --- |
@@ -266,7 +266,7 @@ Phase 2 showed the feature set was the ceiling, so we added two groups of engine
 - Producer with one connection per channel. Holds game metadata from each `featured` event in memory and stamps every move event with it. Handles game switches.
 - Publishes to `tv.moves`, keyed by game id.
 
-**Status (Oct 31): done.** Redpanda v25.1.1 (`--mode dev-container --smp 1`, Kafka on `localhost:19092`) and Console (`localhost:8085`) in `docker-compose.yml`. `ingest/tv_producer.py` runs one thread per channel (`uv run python -m ingest.tv_producer rapid blitz`). On each `featured` event it fetches the game once from `/game/export/{id}` for the time control and the moves so far, sends a `start` message, then stamps every `move` message with the game metadata. A 45 second run on rapid and blitz put 18 messages on `tv.moves` (1 partition, auto-created). Tests in `tests/test_tv_producer.py`.
+**Status: done.** Redpanda v25.1.1 (`--mode dev-container --smp 1`, Kafka on `localhost:19092`) and Console (`localhost:8085`) in `docker-compose.yml`. `ingest/tv_producer.py` runs one thread per channel (`uv run python -m ingest.tv_producer rapid blitz`). On each `featured` event it fetches the game once from `/game/export/{id}` for the time control and the moves so far, sends a `start` message, then stamps every `move` message with the game metadata. A 45 second run on rapid and blitz put 18 messages on `tv.moves` (1 partition, auto-created). Tests in `tests/test_tv_producer.py`.
 
 Gaps found in the check, to fix before phase 6:
 
@@ -282,7 +282,7 @@ Gaps found in the check, to fix before phase 6:
 - A consumer task writes `games.archive` to `bronze/archive/` on RustFS.
 - DAG `train_blunder_model` (every 6 hours, see the replay and retraining schedule): replay next batch → land in bronze → Spark features → train → evaluate on newest batch → register → promote `champion` if better.
 
-**Status (Oct 31): storage, tracking and training done; Airflow, replay and DAG still to do.**
+**Status: storage, tracking and training done; Airflow, replay and DAG still to do.**
 
 - Compose (B) adds RustFS (S3 API on `localhost:9000`, console on `9001`), Postgres 16 (databases `airflow`, `mlflow`, `chess`; `docker/postgres-init.sql` only runs when the volume is first created), pgAdmin (`localhost:5050`) and MLflow 3.17.2 (`localhost:5000`, Postgres backend, artifacts in the `mlflow` bucket, same version as `uv.lock`). `storage/create_buckets.py` creates `bronze`, `silver`, `gold` and `mlflow`; `storage/check_setup.py` checks MLflow logs to Postgres and RustFS.
 - `training/train_model.py` trains with the phase 2 settings on the feature table, holds out the newest 6 parts, logs parameters, metrics (incl. the clock-only baseline and the lift over it) and the feature list as the `features` tag, registers the version and gives it the `challenger` alias.
@@ -300,7 +300,7 @@ Gaps found in the check, to fix before phase 6:
 - Window functions within each game: seconds spent on the previous move, `plies_out_of_book`, rolling features.
 - Write gold features to RustFS. Runs in Spark local mode inside the Airflow task.
 
-**Status (Oct 31): done.** `ingest/parse_bronze.py` parses `bronze/archive/` into `bronze/moves/` with the board features (python-chess, multiprocessing). `spark/build_features.py` cleans into `silver/moves/` and builds `gold/features/` with the opening book join and window functions. The DAG runs them as `parse_moves` → `spark_features`.
+**Status: done.** `ingest/parse_bronze.py` parses `bronze/archive/` into `bronze/moves/` with the board features (python-chess, multiprocessing). `spark/build_features.py` cleans into `silver/moves/` and builds `gold/features/` with the opening book join and window functions. The DAG runs them as `parse_moves` → `spark_features`.
 
 - **Change from the plan: a standalone cluster instead of local mode.** Spark master, one worker (2 cores, 2 GB) and a Spark Connect server run in Compose, and the Airflow task is a thin Spark Connect client (`pyspark-client`). The task no longer needs a JVM, but the cluster uses about 3.8 GB while the job runs.
 - Parity: `tests/test_spark_features.py` compares Spark with `GameState` on generated games (needs Spark Connect on `localhost:15002`, otherwise it is skipped). On real data (Oct 31, 24,737 games, 1,607,476 rows), the Spark output equals the earlier Python-built `gold/features` in every feature, the label and the part, apart from bot and UltraBullet games, which Spark now drops in silver and training dropped anyway. Together with `tests/test_live_game.py` this closes the loop: Spark = `GameState` = live consumer.
@@ -315,7 +315,7 @@ Gaps found in the check, to fix before phase 6:
 - Write raw events to `bronze/tv/` on RustFS.
 - Test that a known position produces identical feature vectors through the Spark path and the consumer path.
 
-Ready from phase 4 (Oct 31): the champion is registered, so the consumer can be built against it now.
+**Status: done.**  The champion is registered, so the consumer can be built against it now.
 
 - Call `storage.tracking.connect()` before any MLflow call when running on the host, load the model with `mlflow.sklearn.load_model("models:/blunder@champion")`, and score with `model.predict_proba(model_input([features]))[0, 1]`.
 - Check at startup that the champion run's `features` tag equals `features.FEATURES`.
@@ -338,7 +338,7 @@ Ready from phase 4 (Oct 31): the champion is registered, so the consumer can be 
 - Normalise each FEN key to its first three fields, deduplicate, and write `gold/openings/` (FEN key, ECO code, name) as Parquet.
 - Sanity check: the starting position after `1. e4` and after `1. d4 d5 2. c4` both resolve to a named opening.
 
-**Status (Oct 30): local version done** (done early because phase 2 needs it). `ingest/load_openings.py` downloads the six files from pinned commit `e397a1fa` to `data/raw/eco/e397a1fa/` and writes `data/parquet/openings/openings.parquet`; `features/openings.py` loads it as a lookup. The Airflow task and the RustFS upload come with phase 4. Details:
+**Status: local version done** (done early because phase 2 needs it). `ingest/load_openings.py` downloads the six files from pinned commit `e397a1fa` to `data/raw/eco/e397a1fa/` and writes `data/parquet/openings/openings.parquet`; `features/openings.py` loads it as a lookup. The Airflow task and the RustFS upload come with phase 4. Details:
 
 - 15,838 raw entries become 15,373 unique positions (12,105 named, 3,268 interpolated) after shortening the FEN keys.
 - Every entry's move sequence is replayed with python-chess and checked against its key. All 15,838 pass, once move numbers written without a space (`1.e4`) are handled.
@@ -363,50 +363,3 @@ Coverage on the 3.87M parsed moves: 9.0% of moves are in book (8.7% without inte
 - [ ] Start the archive download in the background today
 - [ ] Run the TV feed for 30 seconds and check the real event schema before writing the producer
 
-## Decisions to defend at grading
-
-Each of these is a deliberate choice with a reason. Writing the reason down now means we can answer without improvising later.
-
-**Two-pass PGN parsing.** Text-scan for `[%eval` first, full-parse only the survivors. Full parsing runs at roughly 150-500 games per second per core, so parsing everything would take hours; parsing the annotated 6% takes minutes.
-
-**No python-chess inside Spark UDFs.** Row-by-row serialization across tens of millions of plies would be brutal, and it would mean installing python-chess in the worker image. Parsing is plain Python, Spark does columnar work.
-
-**No Stockfish in the live path.** Far too slow for a streaming consumer. We train offline on precomputed evaluations and infer online without an engine. If we want live accuracy tracking, a separate low-frequency DAG runs shallow-depth evaluation on a sample of positions.
-
-**Producer enriches events with game metadata.** Ratings arrive once in the `featured` event, not in each move event. The producer holds game metadata in memory and stamps every published message with it, so consumers need no external lookups for metadata.
-
-**One feature module imported by both lanes.** Training and serving skew is the real technical risk. If legal move count or the FEN key is computed differently in the Spark job and the live consumer, predictions degrade silently. We test that a known position produces identical vectors through both paths.
-
-**Redpanda instead of Apache Kafka.** Same Kafka API and client libraries, no ZooKeeper or JVM, much lower memory use, and the tool we were taught with.
-
-**Opening book from a static file, not an API.** eco.json is a pinned, versioned file loaded once into RustFS, so there is no external call in the consumer hot path, no rate limits and no failure mode during the demo.
-
-**Opening book not sent through Redpanda.** Redpanda carries event data: games and moves that arrive over time. eco.json is 12k rows of reference data that changes never, so an Airflow task loads it straight into bronze. Pushing a fixed lookup table through a message queue adds nothing.
-
-**Archive replayed through Redpanda with a checkpoint.** The assignment requires Kafka for ingestion and requires that each run of the simulation program sends the next new data. The replay producer satisfies both: it publishes the archive in batches and resumes from a stored offset. It also makes periodic retraining meaningful, because each run adds new games.
-
-**Time-based test split and champion comparison.** Each retrain is tested on the newest batch it has not seen, and the challenger only replaces the champion if it scores better on that same batch. A random split would leak games from the same period into training and flatter the metrics.
-
-**Raw live events kept on RustFS.** Predictions go to Postgres for the dashboard, but the raw TV feed is also written to bronze so all data lands in the lake and can be reprocessed later.
-
-## Risks and open questions
-
-**Infrastructure is the real risk, not the data.** Redpanda, Spark, Airflow, MLflow, RustFS, Postgres and Streamlit all running on Docker Desktop on a Windows laptop is the memory wall, and it will bite long before PGN parsing does. Mitigations: raise the WSL limit, run Redpanda in dev-container mode, run Spark in local mode rather than master and worker, use `LocalExecutor` instead of Celery, and bring services up in stages while developing rather than keeping the full stack hot.
-
-**Stream volume is thin.** Eight TV channels produce maybe one to two events per second. If that looks unimpressive, `POST /api/stream/games-by-users` with a few hundred usernames harvested from the leaderboards gives a real firehose.
-
-**Game transitions.** The feed sends a new `featured` event when a channel switches games. If the consumer assumes one continuous game, the dashboard will silently show a finished game during the demo, and the per-game state (previous clock, last in-book ply) will carry over into the wrong game.
-
-**Class imbalance.** Blunders are a few percent of moves. Plan for stratified sampling and class weights from the start.
-
-**Opening book coverage is shallow.** Most games leave eco.json within 10–20 plies, so `in_book` is false for most moves. `plies_out_of_book` carries the signal after that; check in phase 2 that it actually helps the model.
-
-Open questions to settle between us:
-
-- [ ] Confirm the replay defaults: 20k backfill, 5k per run, every 6 hours, 60k training window
-- [x] Do we include `eco_interpolated.json` (gap-filling positions) or only the named openings in `ecoA` … `ecoE`? Yes, flagged with `is_interpolated` so phase 2 can compare
-- [x] Which month of the archive? September 2026, first 3 GB (SHA-256 in the README)
-- [ ] Which month of the archive do we use, and do we both work from the same slice?
-- [x] Blunder threshold — what win-probability drop counts? 0.15 (`BLUNDER_THRESHOLD` in `features/`)
-- [x] Do we exclude bot games and unrated players? Bots out (194 of 59,894 games, blunder rate 4.3% vs 6.9%), in training and live. Unrated is moot for training: the archive file holds rated games only. Live, casual games are scored. UltraBullet is excluded too (171 games, no TV channel)
-- [ ] Which channel does the dashboard default to? Rapid or classical will look more responsive than bullet, given Streamlit's polling refresh.
